@@ -1,0 +1,131 @@
+@import "tailwindcss";
+
+@theme {
+  --color-background: #ffffff;
+  --color-foreground: #0a0a0a;
+
+  --color-card: #ffffff;
+  --color-card-foreground: #0a0a0a;
+
+  --color-muted: #f5f5f5;
+  --color-muted-foreground: #737373;
+
+  --color-primary: #0a0a0a;
+  --color-primary-foreground: #fafafa;
+
+  --color-secondary: #f5f5f5;
+  --color-secondary-foreground: #0a0a0a;
+
+  --color-accent: #f5f5f5;
+  --color-accent-foreground: #0a0a0a;
+
+  --color-destructive: #dc2626;
+  --color-destructive-foreground: #ffffff;
+
+  --color-border: #e5e5e5;
+  --color-input: #e5e5e5;
+  --color-ring: #0a0a0a;
+
+  --radius-card: 0.75rem;
+}
+
+@layer base {
+  * {
+    border-color: var(--color-border);
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+      "Helvetica Neue", Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  ::selection {
+    background-color: var(--color-foreground);
+    color: var(--color-background);
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * Payment success animation.
+ *
+ * The tick draws itself (stroke-dashoffset 48 -> 0) just after the circle
+ * finishes (delay 180ms), then the whole mark settles with a small scale pop.
+ * Wrapped in prefers-reduced-motion so anyone who has asked for less motion
+ * simply sees the finished tick with no animation at all.
+ * --------------------------------------------------------------------------- */
+@keyframes rs-draw-circle {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+@keyframes rs-draw-tick {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+@keyframes rs-pop {
+  0% {
+    transform: scale(0.85);
+    opacity: 0;
+  }
+  60% {
+    transform: scale(1.04);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+@keyframes rs-rise {
+  from {
+    transform: translateY(6px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.rs-success-ring {
+  stroke-dasharray: 151;
+  stroke-dashoffset: 151;
+  animation: rs-draw-circle 0.5s ease-out forwards;
+}
+
+.rs-success-tick {
+  stroke-dasharray: 48;
+  stroke-dashoffset: 48;
+  animation: rs-draw-tick 0.3s ease-out 0.35s forwards;
+}
+
+.rs-success-pop {
+  animation: rs-pop 0.4s ease-out forwards;
+}
+
+.rs-rise {
+  animation: rs-rise 0.3s ease-out 0.45s both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rs-success-ring,
+  .rs-success-tick,
+  .rs-success-pop,
+  .rs-rise {
+    animation: none;
+    stroke-dashoffset: 0;
+    opacity: 1;
+    transform: none;
+  }
+}
