@@ -1,0 +1,68 @@
+//DB9GWLM1 PROC DB2SSN=DB9G,NUMTCB=1,APPLENV=DB9GENV1                   00010000
+//*                                                                     00020000
+//* NUMTCB@1 SET NUMTCB=                                                00030000
+//*                                                                     00040000
+//DSNTPSMP EXEC PGM=DSNX9WLM,TIME=1440,                                 00050000
+//             PARM='&DB2SSN,&NUMTCB,&APPLENV',                         00060000
+//             REGION=0M,DYNAMNBR=5                                     00070000
+//* Include SDSNEXIT to use Secondary Authids (DSN3@ATH DSN3@SGN exits) 00080000
+//STEPLIB  DD  DISP=SHR,DSN=DSN910.DB9G.RUNLIB.LOAD                     00090000
+//         DD  DISP=SHR,DSN=DSN910.DB9G.SDSNEXIT                        00110000
+//         DD  DISP=SHR,DSN=DSN910.SDSNLOAD                             00111000
+//         DD  DISP=SHR,DSN=CBC.SCCNCMP                                 00120000
+//         DD  DISP=SHR,DSN=CEE.SCEERUN                                 00130000
+//SYSEXEC  DD  DISP=SHR,                                                00140000
+//             DSN=DSN910.NEW.SDSNCLST                                  00150000
+//SYSTSPRT DD  SYSOUT=*                                                 00160000
+//CEEDUMP  DD  SYSOUT=*                                                 00170000
+//UTPRINT  DD  SYSOUT=*                                                 00180000
+//DSSPRINT DD  SYSOUT=*                                                 00190000
+//SYSIN    DD  UNIT=3390,SPACE=(4000,(20,20),,,ROUND)                   00200000
+//SYSPRINT DD  UNIT=3390,SPACE=(4000,(20,20),,,ROUND)                   00210000
+//SYSABEND DD  DUMMY                                                    00220000
+//DSNTRACE DD  SYSOUT=*                                                 00230000
+//*                                                                     00240000
+//**** Data sets required by the SQL Procedures Processor               00250000
+//SQLDBRM  DD  DISP=SHR,                       <== DBRM Library         00260000
+//             DSN=DSN910.DB9G.DBRMLIB.DATA                             00270000
+//SQLCSRC  DD  DISP=SHR,                       <== Generated C Source   00280000
+//             DSN=DSN910.DB9G.SRCLIB.DATA                              00290000
+//SQLLMOD  DD  DISP=SHR,                       <== Application Loadlib  00300000
+//             DSN=DSN910.DB9G.RUNLIB.LOAD                              00310000
+//SQLLIBC  DD  DISP=SHR,                       <== C header files       00320000
+//             DSN=CEE.SCEEH.H                                          00330000
+//         DD  DISP=SHR,                                                00340000
+//             DSN=CEE.SCEEH.SYS.H                                      00350000
+//SQLLIBL  DD  DISP=SHR,                       <== Linkedit includes    00360000
+//             DSN=CEE.SCEELKED                                         00370000
+//         DD  DISP=SHR,                                                00380000
+//             DSN=DSN910.SDSNLOAD                                      00390000
+//SYSMSGS  DD  DISP=SHR,                       <== Prelinker msg file   00400000
+//             DSN=CEE.SCEEMSGP(EDCPMSGE)                               00410000
+//*                                                                     00420000
+//**** DSNTPSMP Configuration File - CFGTPSMP (optional)                00430000
+//*             A site provided sequential dataset or member, used to   00440000
+//*             define customized operation of DSNTPSMP in this APPLENV.00450000
+//*CFGTPSMP DD  DISP=SHR,DSN=                                           00460000
+//*                                                                     00470000
+//**** Workfiles required by the SQL Procedures Processor               00480000
+//SQLSRC   DD  UNIT=SYSALLDA,SPACE=(23440,(20,20)),                     00490000
+//             DCB=(RECFM=FB,LRECL=80,BLKSIZE=23440)                    00500000
+//SQLPRINT DD  UNIT=SYSALLDA,SPACE=(23476,(20,20)),                     00510000
+//             DCB=(RECFM=VB,LRECL=137,BLKSIZE=23476)                   00520000
+//SQLTERM  DD  UNIT=SYSALLDA,SPACE=(23476,(20,20)),                     00530000
+//             DCB=(RECFM=VB,LRECL=137,BLKSIZE=23476)                   00540000
+//SQLOUT   DD  UNIT=SYSALLDA,SPACE=(23476,(20,20)),                     00550000
+//             DCB=(RECFM=VB,LRECL=137,BLKSIZE=23476)                   00560000
+//SQLCPRT  DD  UNIT=SYSALLDA,SPACE=(23476,(20,20)),                     00570000
+//             DCB=(RECFM=VB,LRECL=137,BLKSIZE=23476)                   00580000
+//SQLUT1   DD  UNIT=SYSALLDA,SPACE=(23440,(20,20)),                     00590000
+//             DCB=(RECFM=FB,LRECL=80,BLKSIZE=23440)                    00600000
+//SQLUT2   DD  UNIT=SYSALLDA,SPACE=(23440,(20,20)),                     00610000
+//             DCB=(RECFM=FB,LRECL=80,BLKSIZE=23440)                    00620000
+//SQLCIN   DD  UNIT=SYSALLDA,SPACE=(32000,(20,20))                      00630000
+//SQLLIN   DD  UNIT=SYSALLDA,SPACE=(3200,(30,30)),                      00640000
+//             DCB=(RECFM=FB,LRECL=80,BLKSIZE=3200)                     00650000
+//SQLDUMMY DD  DUMMY                                                    00660000
+//SYSMOD   DD  UNIT=SYSALLDA,SPACE=(23440,(20,20)),   <= PRELINKER      00670000
+//             DCB=(RECFM=FB,LRECL=80,BLKSIZE=23440)                    00680000
