@@ -156,9 +156,12 @@ DB2_HOST=192.168.200.150
 DB2_PORT=5025
 DB2_LOCATION=DALLAS9
 DB2_USER=IBMUSER
-DB2_PASSWORD=SYS1
+DB2_PASSWORD=<your password>
 DB2_BRIDGE_URL=http://127.0.0.1:8099
 ```
+
+The ADCD sample system ships with `IBMUSER` / `SYS1`; set `DB2_PASSWORD` to
+whatever your LPAR actually uses. `.env` is git-ignored — never commit it.
 
 Unset `DB2_HOST` and the site falls back to the PostgreSQL mirror.
 
