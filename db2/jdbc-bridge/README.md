@@ -48,7 +48,7 @@ Settings are environment variables (all optional):
 | `DB2_PORT` | `5025` |
 | `DB2_LOCATION` | `DALLAS9` |
 | `DB2_USER` | `IBMUSER` |
-| `DB2_PASSWORD` | `SYS1` |
+| `DB2_PASSWORD` | *(none — must be supplied)* |
 
 ## API
 

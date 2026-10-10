@@ -13,16 +13,34 @@ set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
 JARS="$HERE/../db2jdbc"
 
-# Java 17 (Temurin) installed under the WorkBuddy managed binaries directory.
-# Override JAVA_HOME if you have your own JDK.
+# Find a JDK 17+ in this order:
+#   1. JAVA_HOME, if you have set one
+#   2. the JDK bundled with the local tooling, if present
+#   3. whatever `java` is on PATH
+# Override JAVA_HOME if none of these is right.
 if [ -z "$JAVA_HOME" ]; then
-  JAVA_HOME=/Users/redbob/.workbuddy-ai/binaries/java/jdk-17.0.20.1+1/Contents/Home
+  for CANDIDATE in \
+    "$HOME/.workbuddy-ai/binaries/java/jdk-17.0.20.1+1/Contents/Home" \
+    "$HOME/.workbuddy-ai/binaries/java"/*/Contents/Home \
+    /Library/Java/JavaVirtualMachines/*/Contents/Home
+  do
+    if [ -x "$CANDIDATE/bin/java" ]; then
+      JAVA_HOME="$CANDIDATE"
+      break
+    fi
+  done
 fi
-JAVA="$JAVA_HOME/bin/java"
-JAVAC="$JAVA_HOME/bin/javac"
 
-if [ ! -x "$JAVA" ]; then
-  echo "Java not found at $JAVA - set JAVA_HOME to a JDK 17+ install." >&2
+if [ -n "$JAVA_HOME" ] && [ -x "$JAVA_HOME/bin/java" ]; then
+  JAVA="$JAVA_HOME/bin/java"
+  JAVAC="$JAVA_HOME/bin/javac"
+else
+  JAVA=java
+  JAVAC=javac
+fi
+
+if ! command -v "$JAVA" >/dev/null 2>&1; then
+  echo "No JDK found. Set JAVA_HOME to a JDK 17+ install, or put java on PATH." >&2
   exit 1
 fi
 
