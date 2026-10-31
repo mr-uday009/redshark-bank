@@ -7,6 +7,7 @@ import {
   type Recipient,
 } from "@/lib/transfer-service";
 import { checkTransferRateLimit } from "@/lib/auth-rate-limit";
+import { notifyFeedChange } from "@/lib/feed-events";
 
 /**
  * Send money to another Redshark account.
@@ -48,6 +49,10 @@ export async function POST(request: Request) {
       recipient,
       amount,
     });
+
+    // Both sides of the transfer get a new ledger row and a notification, so
+    // both dashboards need to know. Published only after the commit above.
+    await notifyFeedChange([session.userId, recipient.userId], "transfer");
 
     return NextResponse.json({
       ok: true,

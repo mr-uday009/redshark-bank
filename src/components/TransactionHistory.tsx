@@ -1,15 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
-
-interface Transaction {
-  id: number;
-  direction: "SENT" | "RECEIVED";
-  amount: string;
-  counterparty: string;
-  reference: string;
-  createdAt: string;
-}
+import { useDashboardFeed } from "@/components/DashboardFeedProvider";
 
 /**
  * Transaction history.
@@ -17,35 +8,21 @@ interface Transaction {
  * The list has a fixed maximum height and `overflow-y-auto`, so it scrolls
  * internally only once the rows exceed the panel — with a handful of
  * transactions the panel simply grows to fit, which is what the design asked
- * for. Polls every 5 seconds so a transfer appears without a manual reload.
+ * for.
+ *
+ * It no longer polls. The rows come from DashboardFeedProvider, which is
+ * refreshed by a server push only when a transaction or notification actually
+ * changes.
  */
 export default function TransactionHistory() {
-  const [items, setItems] = useState<Transaction[] | null>(null);
-
-  const load = useCallback(async () => {
-    try {
-      const res = await fetch("/api/transactions", { cache: "no-store" });
-      if (!res.ok) return;
-      const data = await res.json();
-      setItems(data.transactions ?? []);
-    } catch {
-      // Keep the last good list; the next poll will retry.
-    }
-  }, []);
-
-  useEffect(() => {
-    load();
-    const id = setInterval(() => {
-      if (!document.hidden) load();
-    }, 5000);
-    return () => clearInterval(id);
-  }, [load]);
+  const { data } = useDashboardFeed();
+  const items = data.transactions;
 
   return (
     <section className="rounded-xl border border-border">
       <header className="flex items-center justify-between border-b border-border px-5 py-4">
         <h2 className="text-sm font-medium">Transaction history</h2>
-        {items && items.length > 0 && (
+        {items.length > 0 && (
           <span className="text-xs text-muted-foreground tabular-nums">
             {items.length}
           </span>
@@ -53,11 +30,7 @@ export default function TransactionHistory() {
       </header>
 
       <div className="max-h-[26rem] overflow-y-auto">
-        {items === null ? (
-          <p className="px-5 py-10 text-center text-sm text-muted-foreground">
-            Loading…
-          </p>
-        ) : items.length === 0 ? (
+        {items.length === 0 ? (
           <div className="px-5 py-12 text-center">
             <p className="text-sm text-muted-foreground">No transactions yet.</p>
             <p className="mt-1 text-xs text-muted-foreground">
