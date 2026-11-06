@@ -700,18 +700,27 @@ curl -s -b cookies.txt http://localhost:3000/api/notifications
 curl -s -b cookies.txt -X POST http://localhost:3000/api/recipients/lookup \
   -H 'Content-Type: application/json' -d '{"identifier":"<payee>"}'
 curl -s -b cookies.txt -X POST http://localhost:3000/api/transactions/send \
-  -H 'Content-Type: application/json' \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: smoke-1' \
   -d '{"identifier":"<payee>","amount":"1.00","password":"TestPass123"}'
+# → {"ok":true,"trxId":"200000000001","idempotencyKey":"smoke-1","duplicate":false,...}
 
-# 6. Dismiss notifications, then re-read
+# 6. Replay the same Idempotency-Key — the receipt comes back, nothing is charged
+curl -s -b cookies.txt -X POST http://localhost:3000/api/transactions/send \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: smoke-1' \
+  -d '{"identifier":"<payee>","amount":"1.00","password":"TestPass123"}'
+# → {"duplicate":true,...} and the sender's balance is unchanged
+
+# 7. Dismiss notifications, then re-read
 curl -s -b cookies.txt -X POST http://localhost:3000/api/notifications/dismiss \
   -H 'Content-Type: application/json' -d '{}'
 curl -s -b cookies.txt http://localhost:3000/api/notifications
 ```
 
 Expected: all `200`, a new `SENT` row, one `money_sent` notification, and
-`unread` dropping to `0` after dismiss. Afterwards delete `cookies.txt`, remove
-the smoke-test rows, and restore any balances you changed.
+`unread` dropping to `0` after dismiss. The send response must carry a 12-digit
+`trxId` that also appears in `GET /api/transactions`, and the replay in step 6
+must return `duplicate: true` without changing the balance. Afterwards delete
+`cookies.txt`, remove the smoke-test rows, and restore any balances you changed.
 
 ---
 
