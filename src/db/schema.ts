@@ -8,6 +8,7 @@
 // functional end-to-end.
 import {
   pgTable,
+  pgSequence,
   serial,
   integer,
   varchar,
@@ -15,6 +16,7 @@ import {
   timestamp,
   boolean,
   uniqueIndex,
+  unique,
   index,
 } from "drizzle-orm/pg-core";
 
@@ -55,16 +57,38 @@ export const bankAccounts = pgTable(
   })
 );
 
+// Allocates the numeric part of TRX_ID. Starting at 200000000000 keeps live
+// IDs in a separate range from the 100000000000+id values used to backfill
+// historical rows, so a fresh sequence can never collide with a legacy row.
+// Both this sequence and BANKAPP.TRX_ID_SEQ on Db2 use the same range.
+export const transactionsTrxIdSeq = pgSequence("transactions_trx_id_seq", {
+  startWith: 200_000_000_000,
+  increment: 1,
+  minValue: 200_000_000_000,
+  maxValue: 999_999_999_999,
+  cycle: false,
+});
+
 // Mirrors mainframe table BANKAPP.TRANSACTIONS.
 //
 // One row per *side* of a transfer: a SENT row for the payer and a RECEIVED
 // row for the payee, linked by `reference`. Storing both sides means the
 // history query is a plain indexed lookup on user_id, with no self-join and
 // no risk of one side going missing.
+//
+// TRX_ID is the business primary key: a unique, 12-digit decimal identifier
+// (CHAR(12) on Db2). IDEMPOTENCY_KEY identifies the original payment request
+// and is shared by both sides of a single transfer. Because one request
+// produces two rows, the uniqueness rule is per (request, account): the same
+// key may appear once for the sender and once for the recipient, but a given
+// account can never submit the same request twice.
 export const transactions = pgTable(
   "transactions",
   {
-    id: serial("id").primaryKey(),
+    // Surrogate row identity, kept for ordering and the feed version probe.
+    id: serial("id").notNull(),
+    // Business primary key: unique 12-digit transaction identifier.
+    trxId: varchar("trx_id", { length: 12 }).primaryKey(),
     userId: integer("user_id")
       .notNull()
       .references(() => authUsers.id, { onDelete: "cascade" }),
@@ -76,10 +100,18 @@ export const transactions = pgTable(
     // Username of the other party, denormalised so history renders without a join.
     counterparty: varchar("counterparty", { length: 50 }).notNull(),
     reference: varchar("reference", { length: 36 }).notNull(),
+    // Identifies the original payment request.
+    idempotencyKey: varchar("idempotency_key", { length: 36 }).notNull(),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => ({
+    idIdx: uniqueIndex("transactions_id_idx").on(table.id),
     userIdx: index("transactions_user_idx").on(table.userId, table.createdAt),
+    // Prevents reuse of an idempotency key by the same account.
+    idempotencyUq: unique("transactions_idempotency_uq").on(
+      table.idempotencyKey,
+      table.userId,
+    ),
   })
 );
 

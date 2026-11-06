@@ -23,10 +23,14 @@ import {
 
 export interface FeedTransaction {
   id: number;
+  /** Unique 12-digit transaction identifier (business primary key). */
+  trxId: string;
   direction: "SENT" | "RECEIVED";
   amount: string;
   counterparty: string;
   reference: string;
+  /** Identifies the original payment request. */
+  idempotencyKey: string;
   createdAt: string;
 }
 

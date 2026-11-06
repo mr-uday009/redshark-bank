@@ -43,7 +43,7 @@ export default async function HomePage() {
     <DashboardFeedProvider initial={feed}>
       <main className="min-h-screen bg-background">
       <header className="border-b border-border">
-        <div className="mx-auto flex max-w-5xl items-center justify-between px-6 py-4">
+        <div className="mx-auto flex max-w-6xl items-center justify-between px-6 py-4">
           <div className="flex items-center gap-2.5">
             <LogoMark />
             <span className="text-base font-medium">Redshark Bank</span>
@@ -55,7 +55,7 @@ export default async function HomePage() {
         </div>
       </header>
 
-      <section className="mx-auto max-w-5xl px-6 py-8">
+      <section className="mx-auto max-w-6xl px-6 py-8">
         <div className="mb-6">
           <h1 className="text-2xl font-medium tracking-tight">
             Welcome back, {session.fullName || session.username}
@@ -69,8 +69,8 @@ export default async function HomePage() {
 
         {/* Left column: balances and accounts. Right column: history, which
             scrolls internally once it outgrows its max height. */}
-        <div className="grid gap-6 lg:grid-cols-5">
-          <div className="space-y-4 lg:col-span-3">
+        <div className="grid gap-6 lg:grid-cols-12">
+          <div className="space-y-4 lg:col-span-7">
             <Card>
               <CardHeader className="pb-2">
                 <CardTitle className="text-sm font-normal text-muted-foreground">
@@ -146,7 +146,7 @@ export default async function HomePage() {
             </div>
           </div>
 
-          <div className="lg:col-span-2">
+          <div className="lg:col-span-5">
             <TransactionHistory />
           </div>
         </div>

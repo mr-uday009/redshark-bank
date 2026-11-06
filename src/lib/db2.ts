@@ -222,11 +222,17 @@ export async function findDb2Recipient(
 
 export interface Db2TransferResult {
   reference: string;
+  /** 12-digit transaction id of the sender's SENT ledger row. */
+  trxId: string;
+  /** Identifies the original payment request; shared by both ledger rows. */
+  idempotencyKey: string;
   amount: string;
   messageToSender: string;
   messageToRecipient: string;
   senderBalance: string;
   recipientBalance: string;
+  /** True when a replayed key returned the original receipt without charging. */
+  duplicate?: boolean;
 }
 
 /**
@@ -246,16 +252,22 @@ export async function sendDb2Transfer(input: {
   recipientUsername: string;
   amount: string;
   reference?: string;
+  /** Client-supplied key for the original payment request. */
+  idempotencyKey?: string;
 }): Promise<Db2TransferResult> {
   return call<Db2TransferResult>("/transfer", { method: "POST", body: input });
 }
 
 export interface Db2Transaction {
   id: number;
+  /** Unique 12-digit business primary key. */
+  trxId: string;
   direction: "SENT" | "RECEIVED";
   amount: string;
   counterparty: string;
   reference: string;
+  /** Identifies the original payment request. */
+  idempotencyKey: string;
   createdAt: string | null;
 }
 
