@@ -1,320 +1,932 @@
-# Sentinel Trust Bank — migrating from PostgreSQL to Db2 for z/OS with ICSF hashing
+# Redshark Bank
 
-This folder holds every mainframe-side artefact needed to move the website off
-the local PostgreSQL mirror and onto **Db2 for z/OS**, with **all password
-hashing performed on the mainframe by ICSF** (SHA-256 via `CSNBOWH`), invoked
-through a **WLM-managed stored procedure**.
+A small online bank that runs against **PostgreSQL** and/or **IBM Db2 for z/OS**.
 
----
+The site is fully functional without a mainframe: PostgreSQL is the always-available
+local store, and Db2 for z/OS is the optional system of record. Passwords are
+hashed with SHA-256 — in Db2 mode **on the mainframe**, by a COBOL stored
+procedure (`BANKAPP.HASHUD`) calling ICSF's `CSNBOWH`. Node's `crypto` produces a
+byte-identical digest, so the same credentials work against either database.
 
-## 1. What the target environment actually is
+Setting `DB2_HOST` is the only switch. When it is set, every read and write goes
+to the mainframe through a local JDBC bridge; when it is unset, everything runs
+against PostgreSQL.
 
-Everything below was verified against the live system.
+> [!IMPORTANT]
+> **Bring your own IBM Db2 JDBC drivers.** This project does **not** provide,
+> bundle, mirror or ship `db2jcc4.jar` and `db2jcc_license_cisuz.jar`. They are
+> IBM-licensed binaries that cannot be redistributed from this repository. You
+> must obtain them yourself — from your own Db2 installation, your z/OS system,
+> or your IBM entitlement — and place them in `db2/db2jdbc/` before the bridge
+> will compile or start. **Db2 mode will not work without them.** Please do not
+> open issues asking for the jars; they are excluded by design. See
+> [Bring your own JDBC drivers](#bring-your-own-jdbc-drivers).
+> PostgreSQL mode needs none of this.
 
-| Item | Value |
-| ---- | ----- |
-| Host | `ADCD.DFW.IBM.COM` (192.168.200.150) |
-| Access | SSH / FTP / TSO-telnet as `IBMUSER` |
-| Db2 | **Db2 9.1 for z/OS**, function level `DSN09015` |
-| Db2 subsystem | **`DB9G`** |
-| Db2 location | **`DALLAS9`** (DRDA port 5025) |
-| COBOL compiler | `IGY420.SIGYCOMP` (Enterprise COBOL 4.2) |
-| LE runtime / link-edit | `CEE.SCEERUN`, `CEE.SCEELKED` |
-| ICSF modules | `CSF.SCSFMOD0` — **already in the LNKLST** |
-| Db2 load library | `DSN910.DB9G.RUNLIB.LOAD` |
-| WLM app environment | `DB9GENV1` (procedure `DB9GWLM1`) |
-| Source of HASHUD | `IBMUSER.HDFC.ICSF(HASHUD)` |
-
----
-
-## 2. The plan
-
-```
-browser
-   |  HTTPS  (plaintext password, never stored)
-   v
-Next.js API route  /api/auth/register | /api/auth/login
-   |  ibm_db  (or JDBC bridge)  DATABASE=DALLAS9;HOSTNAME=...;PORT=5025
-   v
-Db2 for z/OS  ---- CALL BANKAPP.HASHUD(?,?,?,?) ---->  WLM application env DB9GENV1
-                                                             |
-                                                             v  load module HASHUD
-                                                        (IBMUSER.HDFC.LOAD)
-                                                             |
-                                                             v  CALL 'CSNBOWH'
-                                                        ICSF SHA-256
-                                                             |
-   <----- 64-char uppercase hex digest ----------------------
-   |
-   v
-INSERT/SELECT BANKAPP.USERS  (PASSWORD_HASH CHAR(64))
-```
-
-Steps:
-
-1. **Create the Db2 objects** — `sql/01-create-objects.sql`.
-   `BANKDB` database, `BANKAPP.USERS` and `BANKAPP.ACCOUNTS`, matching the
-   existing `users` schema (`id, username, email, full_name, password_hash,
-   created_at`).
-2. **Start the database** — `jcl/START-DATABASE.jcl`.
-   `CREATE DATABASE` leaves it `STOPPED`; until you `-START DATABASE(BANKDB)`
-   every access fails with `-540`.
-3. **Build the hashing routine** — `jcl/BUILD-HASHUD.jcl`.
-   Compiles `cobol/HASHUD.cbl` (reentrant) and link-edits load module
-   `HASHUD` into `IBMUSER.HDFC.LOAD` **and** into the WLM STEPLIB library
-   `DSN910.DB9G.RUNLIB.LOAD`.
-4. **Make the WLM environment usable** — `wlm/README.md`.
-   Copy `DB9GWLM1` into `USER.PROCLIB` so JES2 can find it.
-5. **Register the procedure** — `sql/02-create-procedure.sql`.
-   `BANKAPP.HASHUD`, `LANGUAGE COBOL`, `PARAMETER STYLE GENERAL`,
-   `EXTERNAL NAME HASHUD`, `WLM ENVIRONMENT DB9GENV1`, `NO SQL`.
-6. **Migrate the existing rows** — `sql/03-migrate-users.sql`.
-   The two PostgreSQL rows move across with their SHA-256 hashes intact.
-7. **Point the website at Db2** — set the `DB2_*` variables (section 5).
+> **New here?** Jump to [Quick start](#quick-start-postgresql-mode). You need
+> Node.js, PostgreSQL, and about five minutes. No mainframe, no Java, no JDBC
+> jars, no 3270 terminal required. Db2 mode is entirely optional and documented
+> separately in [Db2 for z/OS mode](#db2-for-zos-mode-optional).
 
 ---
 
-## 3. Two Db2 for z/OS gotchas found the hard way
+## Contents
 
-### 3.1 `CREATE DATABASE` leaves the database STOPPED
-
-A freshly created database is stopped. `CREATE TABLE` succeeds (it is catalog
-only) but every later `INSERT`/`SELECT` returns
-`SQLCODE -540, SQLSTATE 57001, SQLERRMC <table>`.
-
-```
-DSN SYSTEM(DB9G)
--START DATABASE(BANKDB)
--DISPLAY DATABASE(BANKDB) SPACENAM(BANKTS)
-END
-```
-
-### 3.2 Do not put the tables in a hand-made table space
-
-If the tables are created with `IN BANKDB.BANKTS` and that table space has no
-**companion index table space in the same database**, then every table that has
-a `PRIMARY KEY` or a unique index becomes unusable (`-540` on `INSERT`/`SELECT`).
-A single segmented table space cannot host both tables and indexes.
-
-Omit the `IN` clause and Db2 allocates a matching table space **and** index
-table space automatically. That is what `sql/01-create-objects.sql` does.
-
-### 3.3 `VARCHAR` parameters in a COBOL stored procedure
-
-Db2 passes a `VARCHAR(n)` parameter to COBOL as a **2-byte binary length
-followed by n bytes of data**:
-
-```cobol
-01  LS-INPUT-TEXT.
-    05 LS-INPUT-TEXT-LEN   PIC S9(4) COMP.
-    05 LS-INPUT-TEXT-DATA  PIC X(100).
-```
-
-The original `HASHUD` declared a flat `PIC X(100)` and recovered the length with
-`FUNCTION STORED-CHAR-LENGTH`, which Enterprise COBOL 4.2 rejects
-(`IGYPS2130-S`) and which loses trailing data. `cobol/HASHUD.cbl` here uses the
-length prefix instead.
+- [Stack](#stack)
+- [How it fits together](#how-it-fits-together)
+- [Requirements](#requirements)
+- [Quick start (PostgreSQL mode)](#quick-start-postgresql-mode)
+- [Configuration reference](#configuration-reference)
+- [Database schema](#database-schema)
+- [HTTP API](#http-api)
+- [Db2 for z/OS mode (optional)](#db2-for-zos-mode-optional)
+  - [Bring your own JDBC drivers](#bring-your-own-jdbc-drivers)
+- [Verification checklist](#verification-checklist)
+- [Day-to-day operation](#day-to-day-operation)
+- [Troubleshooting](#troubleshooting)
+- [Security notes](#security-notes)
+- [Repository layout](#repository-layout)
+- [Not committed](#not-committed)
 
 ---
 
-## 4. Files
+## Stack
 
-| File | Purpose |
-| ---- | ------- |
-| `cobol/HASHUD.cbl` | ICSF SHA-256 hashing routine, corrected for Db2 COBOL linkage and reentrant (`RENT`) |
-| `sql/01-create-objects.sql` | `BANKDB` database + `BANKAPP.USERS` / `BANKAPP.ACCOUNTS` + indexes |
-| `sql/02-create-procedure.sql` | Registers `BANKAPP.HASHUD` and grants EXECUTE |
-| `sql/03-migrate-users.sql` | Moves the two existing PostgreSQL rows into Db2 |
-| `sql/04-verify.sql` | Status checks + a `CALL` with the expected digest |
-| `jcl/BUILD-HASHUD.jcl` | Compile + link-edit `HASHUD` into both load libraries |
-| `jcl/START-DATABASE.jcl` | `-START DATABASE(BANKDB)` via the Db2 command processor |
-| `jcl/RUN-SQL.jcl` | Template for running any `sql/*.sql` in batch (DSNTEP2) |
-| `wlm/DB9GWLM1.proc` | The WLM stored-procedure JCL, ready to drop into `USER.PROCLIB` |
-| `wlm/README.md` | WLM application-environment setup, including how to define `WLMENV1` |
-| `jdbc-bridge/Db2Bridge.java` | HTTP service that owns the JDBC connection the Node site uses |
-| `jdbc-bridge/run-bridge.sh` | Compiles (if needed) and starts the bridge |
-| `jdbc-bridge/README.md` | Bridge API reference |
-| `db2jdbc/db2jcc4.jar`, `db2jdbc/db2jcc_license_cisuz.jar` | JDBC driver + free z/OS licence |
-| `java/Db2Test.java` | Standalone JDBC connectivity smoke test |
+| Layer | Technology |
+| --- | --- |
+| App | Next.js 16 (App Router), React 19, Tailwind CSS v4, TypeScript |
+| Local store | PostgreSQL 16 via Drizzle ORM |
+| Mainframe | **Db2 for z/OS V9 or later**, COBOL, ICSF, JCL, WLM |
+| Bridge | Java 17 + IBM JDBC jars (**supplied by you**), local HTTP on `127.0.0.1:8099` |
+| Auth | Signed, HTTP-only session cookies; SHA-256 password digests |
+
+## How it fits together
+
+```
+Browser
+   │
+Next.js app ── src/lib/*.ts ──┬── JDBC bridge :8099 ── Db2 for z/OS ── ICSF
+                              │                          BANKAPP.HASHUD
+                              └── Drizzle ──── PostgreSQL :5432
+```
+
+`isDb2Configured()` — literally "is `DB2_HOST` set" — decides which side runs.
+Every read and write in `src/lib/auth-service.ts` and
+`src/lib/transfer-service.ts` branches on it. `GET /api/db2/status` reports which
+hashing engine actually ran (`icsf` or `local`), so a silent fallback cannot hide.
+
+The bridge deliberately exposes **fixed, parameterised operations only**. There is
+no generic SQL endpoint, so a compromised web tier cannot run arbitrary SQL.
 
 ---
 
-## 5. Connecting the website
+## Requirements
 
-The site is Node/Next.js and talks to Db2 through a small local **JDBC bridge**
-(`jdbc-bridge/Db2Bridge.java`). See `jdbc-bridge/README.md` for the API.
+| Tool | Version | Check |
+| --- | --- | --- |
+| Node.js | 22.x | `node --version` |
+| npm | 10+ | `npm --version` |
+| PostgreSQL | 16 (14+ works) | `psql --version` |
+| Git | any recent | `git --version` |
+| JDK | 17+ — **Db2 mode only** | `java -version` |
+| IBM Db2 JDBC driver jars | your own licensed copy — **Db2 mode only, bring your own** | `ls db2/db2jdbc/*.jar` |
+| 3270 terminal | **Db2 mode only** (e.g. x3270, pw3270, a TN3270 emulator) | — |
+
+Db2 mode targets **Db2 for z/OS V9 or later** (V9, V10, V11, V12, V13 …). The
+SQL, JCL and COBOL in this repository were authored against V9; substitute the
+library, plan and load-module names that match your release.
+
+> [!IMPORTANT]
+> The IBM JDBC driver jars are **not supplied with this project**. Obtain them
+> yourself before attempting Db2 mode — see
+> [Bring your own JDBC drivers](#bring-your-own-jdbc-drivers).
+
+### Platform support
+
+| Platform | PostgreSQL mode | Db2 for z/OS mode |
+| --- | --- | --- |
+| macOS | native | native (JDK 17 + a POSIX shell) |
+| Linux | native | native |
+| Windows | native (Node + PostgreSQL for Windows) | **WSL2** — the bridge scripts are POSIX shell and use a `:`-separated Java classpath |
+
+Shell examples below are POSIX. On native Windows use the equivalents (`copy`
+for `cp`, `curl.exe` rather than PowerShell's `curl` alias), or run them in Git
+Bash / WSL2.
+
+### Install the prerequisites
+
+**macOS (Homebrew)**
 
 ```sh
-cd db2/jdbc-bridge && ./run-bridge.sh     # listens on 127.0.0.1:8099
-npm run dev                                # in another terminal, from the repo root
+brew install git node@22 postgresql@16 openjdk@17
+brew services start postgresql@16
+
+# Make the JDK visible to Java tooling
+sudo ln -sfn /opt/homebrew/opt/openjdk@17/libexec/openjdk \
+  /Library/Java/JavaVirtualMachines/openjdk-17.jdk
+export JAVA_HOME=$(/usr/libexec/java_home -v 17)
 ```
 
-`.env`:
+**Debian / Ubuntu**
 
+```sh
+sudo apt update
+sudo apt install -y git curl postgresql openjdk-17-jdk
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt install -y nodejs
+sudo systemctl enable --now postgresql
 ```
-DB2_HOST=192.168.200.150
-DB2_PORT=5025
-DB2_LOCATION=DALLAS9
-DB2_USER=IBMUSER
-DB2_PASSWORD=<your password>
+
+> The `postgresql-16` package is only needed when your distribution does not
+> already ship 16. Substitute your distribution's package name as appropriate.
+
+**Fedora / RHEL**
+
+```sh
+sudo dnf install -y git curl postgresql-server java-17-openjdk-devel nodejs
+sudo postgresql-setup --initdb
+sudo systemctl enable --now postgresql
+```
+
+**Windows**
+
+Install Node.js 22, PostgreSQL for Windows, Git for Windows, and (for Db2 mode)
+a JDK 17 inside WSL2. For Db2 mode, do the entire setup inside WSL2 so the
+bridge scripts and Java classpath work unchanged.
+
+---
+
+## Quick start (PostgreSQL mode)
+
+### 1. Get the code
+
+```sh
+git clone https://github.com/mr-uday009/redshark-bank.git
+cd redshark-bank
+npm install
+```
+
+`main` is the stable branch. If you are working from a fork or a feature branch,
+check where you are first with `git branch --show-current` and `git status --short`.
+
+### 2. Create the database
+
+The app expects a database named `app_db` and a PostgreSQL role matching the one
+in `DATABASE_URL`.
+
+```sh
+createdb app_db                 # macOS/Homebrew: runs as your own OS user
+psql -d app_db -c "select current_user, current_database();"
+```
+
+On Linux, PostgreSQL uses peer authentication for local connections, so run as
+the `postgres` OS account and create a role for yourself:
+
+```sh
+sudo -u postgres createuser -s <your-username>
+sudo -u postgres createdb -O <your-username> app_db
+psql -d app_db -c "select current_user, current_database();"
+```
+
+On Windows, use `createdb`/`psql` from the PostgreSQL `bin` directory, or create
+the database and role in pgAdmin.
+
+### 3. Apply the schema
+
+The simplest, platform-independent route is to apply the committed SQL
+migrations directly:
+
+```sh
+psql -d app_db -f drizzle/0000_orange_magus.sql
+psql -d app_db -f drizzle/0001_transactions_notifications.sql
+psql -d app_db -c "\dt"
+```
+
+Alternatively, use Drizzle Kit. **Before running it**, edit
+`drizzle.config.json` — it ships with a hard-coded example URL that will not
+match a fresh machine:
+
+```json
+{
+  "dialect": "postgresql",
+  "schema": "./src/db/schema.ts",
+  "dbCredentials": { "url": "postgresql://<user>@localhost:5432/app_db" }
+}
+```
+
+Drizzle Kit reads that file, **not** `.env`. Then:
+
+```sh
+npx drizzle-kit push
+```
+
+### 4. Configure `.env`
+
+```sh
+cp .env.example .env
+```
+
+> **Important — the shipped template is in Db2 mode.** `.env.example` ships with
+> a `DB2_*` block that points at a sample lab LPAR. For PostgreSQL mode,
+> **comment out every `DB2_*` line** (at minimum `DB2_HOST`). If you leave
+> `DB2_HOST` set, the app will try to reach a mainframe that is not there.
+
+Minimum PostgreSQL-mode `.env`:
+
+```dotenv
+DATABASE_URL=postgresql://<user>@localhost:5432/app_db
+SESSION_SECRET=<a-long-random-string>
+```
+
+Generate a real secret (works on every platform, no extra tools needed):
+
+```sh
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+```
+
+`SESSION_SECRET` is not present in the shipped `.env.example` yet — add the line
+manually. It defaults to `dev-only-insecure-secret-change-me` when omitted,
+which is fine locally and must not be used in production.
+
+Keep `DATABASE_URL` set **even in Db2 mode**: `src/db/index.ts` throws at import
+time when it is missing, and `/api/health` always runs `SELECT 1` against
+PostgreSQL. PostgreSQL must be running in both modes.
+
+### 5. Run
+
+```sh
+npm run dev
+```
+
+Open <http://localhost:3000/register>, create an account, then log in.
+Registration opens a CHECKING account with a `0.00` balance. To exercise
+transfers, give yourself funds and register a second user:
+
+```sh
+psql -d app_db -c "update bank_accounts set balance = 500.00 where user_id = 1;"
+```
+
+Useful checks:
+
+```sh
+curl -s http://localhost:3000/api/health          # {"ok":true}
+curl -s http://localhost:3000/api/db2/status     # configured:false
+npm run typecheck
+npm run lint
+npm run build
+```
+
+---
+
+## Configuration reference
+
+All settings live in `.env` (git-ignored). Secrets are shown as `<...>` and
+should never be committed.
+
+| Variable | Used by | Default | Purpose |
+| --- | --- | --- | --- |
+| `DATABASE_URL` | Next.js | — **required** | PostgreSQL connection string. Always keep it set. |
+| `SESSION_SECRET` | Next.js | insecure dev value | HMAC key for session cookies. Set a random value in production. |
+| `DB2_HOST` | Next.js + bridge | — | **The mode switch.** Set = Db2 mode; unset = PostgreSQL mode. |
+| `DB2_PORT` | Next.js + bridge | `5025` | Db2 DRDA port. |
+| `DB2_LOCATION` | Next.js + bridge | `DALLAS9` | Db2 location name. |
+| `DB2_USER` | bridge | `IBMUSER` | z/OS userid for JDBC. |
+| `DB2_PASSWORD` | bridge | *(none — supply it)* | z/OS password. Secret. |
+| `DB2_BRIDGE_URL` | Next.js | `http://127.0.0.1:8099` | Where the app finds the bridge. |
+| `BRIDGE_HOST` | bridge | `127.0.0.1` | Bridge listen address. Keep it loopback. |
+| `BRIDGE_PORT` | bridge | `8099` | Bridge listen port. |
+| `JAVA_HOME` | `run-bridge.sh` | auto-detected | JDK 17+ install, if `java` is not on `PATH`. |
+| `RATE_LIMIT_LOGIN_IP_MAX` / `_WINDOW` | Next.js | `20` / `300` | Login attempts per IP (bucket size / refill seconds). |
+| `RATE_LIMIT_LOGIN_ACCT_MAX` / `_WINDOW` | Next.js | `5` / `300` | Login attempts per account. |
+| `RATE_LIMIT_REGISTER_IP_MAX` / `_WINDOW` | Next.js | `5` / `3600` | Registrations per IP. |
+| `RATE_LIMIT_TRANSFER_MAX` / `_WINDOW` | Next.js | `10` / `60` | Transfers per session. |
+
+> The bridge is a separate process and **does not read `.env`**. Export its
+> `DB2_*` variables in the shell that starts it (see
+> [Start the bridge](#5-start-the-jdbc-bridge)). The Next.js app reads `.env`;
+> the bridge reads process environment. Both need the same values.
+
+> The sample values in `.env.example` and the defaults in `run-bridge.sh`
+> (`DALLAS9`, `IBMUSER`, port `5025`, the sample host) come from an ADCD lab
+> LPAR. Replace them with the host, port, location, userid and password of your
+> own z/OS system.
+
+---
+
+## Database schema
+
+Four tables, mirrored on both databases. One transfer produces **two** ledger
+rows — a `SENT` row for the payer and a `RECEIVED` row for the payee — linked by
+`reference`, so history is a single indexed lookup per user.
+
+| PostgreSQL | Db2 for z/OS | Purpose |
+| --- | --- | --- |
+| `auth_users` | `BANKAPP.USERS` | Credentials; `password_hash` holds a 64-char SHA-256 hex digest. |
+| `bank_accounts` | `BANKAPP.ACCOUNTS` | One or more accounts per user; `DECIMAL(14,2)` balance. |
+| `transactions` | `BANKAPP.TRANSACTIONS` | One row per side of a transfer. |
+| `notifications` | `BANKAPP.NOTIFICATIONS` | `money_sent` / `money_received`, with a read flag. |
+
+The authoritative definitions are `src/db/schema.ts` and `drizzle/*.sql` for
+PostgreSQL, and `db2/sql/01-create-objects.sql` plus
+`db2/sql/09-transactions-notifications.sql` for Db2.
+
+---
+
+## HTTP API
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/api/health` | Liveness (also checks PostgreSQL). |
+| GET | `/api/db2/status` | Which database is active and which hash engine actually ran. |
+| POST | `/api/auth/register` | `{username,email,fullName,password}` |
+| POST | `/api/auth/login` | `{usernameOrEmail,password}` |
+| POST | `/api/auth/logout` | End the session. |
+| GET | `/api/auth/me` | Current session. |
+| POST | `/api/recipients/lookup` | `{identifier}` → payee, by username, email, or account number. |
+| GET | `/api/transactions` | Last 50 ledger rows. |
+| POST | `/api/transactions/send` | `{identifier,amount,password}` — password-confirmed. |
+| GET | `/api/notifications` | Last 50 plus an `unread` count. |
+| POST | `/api/notifications/dismiss` | `{id}` or `{}` for all. |
+| GET | `/api/feed` | One dashboard snapshot, with ETag / `304` support. |
+| GET | `/api/feed/stream` | Server-sent events: a `change` signal, not the data itself. |
+
+On branches that predate the event-driven feed, the dashboard polls
+`/api/transactions` and `/api/notifications` instead.
+
+---
+
+## Db2 for z/OS mode (optional)
+
+This half needs a reachable z/OS system with **Db2 for z/OS V9 or later**, ICSF,
+WLM, a 3270 connection for the mainframe-side build steps, and **your own IBM
+JDBC driver jars**. Everything here is optional — the site is complete in
+PostgreSQL mode.
+
+Values below are written as placeholders. Substitute your own subsystem,
+location, data set names, libraries and credentials wherever the repository's
+JCL and SQL contain hard-coded sample names such as `DB9G`, `DALLAS9`,
+`DSN910.*`, `IBMUSER.*` or `DB9GENV1`. Those names come from a Db2 V9 system;
+newer releases use different libraries and plans.
+
+### Bring your own JDBC drivers
+
+> [!IMPORTANT]
+> **This repository does not contain the IBM Db2 JDBC drivers, and the
+> maintainer cannot provide them.** They are IBM-licensed binaries that must be
+> obtained by each user under their own entitlement. Do not ask for them in an
+> issue, and do not commit them to a fork.
+
+You need these two files before anything in this section will work:
+
+| File | What it is |
+| --- | --- |
+| `db2jcc4.jar` | IBM Data Server Driver for JDBC and SQLJ (type 4 driver). |
+| `db2jcc_license_cisuz.jar` | Licence file that enables direct z/OS connectivity without a paid Db2 Connect licence. |
+
+Legitimate sources, depending on what you are entitled to:
+
+- The JDBC classes shipped with your own Db2 for z/OS installation (look under
+  the `/usr/lpp/db2*` product libraries on USS).
+- An IBM Data Server Driver for JDBC and SQLJ / Db2 client package you
+  downloaded from IBM (Fix Central, Passport Advantage, or your IBM entitlement).
+- Your organisation's internal, licensed copy of the driver.
+
+Copy **your** files into the repository (the directory is git-ignored):
+
+```sh
+mkdir -p db2/db2jdbc
+cp /path/to/your/db2jcc4.jar              db2/db2jdbc/
+cp /path/to/your/db2jcc_license_cisuz.jar db2/db2jdbc/
+ls -l db2/db2jdbc/*.jar
+```
+
+`run-bridge.sh` expects exactly those two names at that path. If the driver
+package you are entitled to ships a single combined jar instead, edit the
+`CLASSPATH` in `run-bridge.sh` to match — the script currently references both
+filenames.
+
+Without them the bridge fails immediately: `javac` cannot resolve
+`com.ibm.db2.jcc.*`, or the JVM throws
+`ClassNotFoundException: com.ibm.db2.jcc.DB2Driver`. This is a missing-driver
+problem on your side, not a bug in this project. PostgreSQL mode is unaffected.
+
+### 1. Reach the mainframe
+
+Older z/OS sshd builds often need legacy algorithms:
+
+```sh
+ssh -oKexAlgorithms=+diffie-hellman-group1-sha1 \
+    -oHostKeyAlgorithms=+ssh-rsa \
+    <user>@<zos-host>
+```
+
+You land in **z/OS UNIX System Services (USS)**. On the reference system:
+
+- `PATH` is just `/bin`.
+- `submit <file.jcl>` submits JCL to JES and prints the job id.
+- There is no `tsocmd`, `db2`, `dsn` or `opercmd` on the image; use JCL that
+  drives the `DSN` TSO command processor instead.
+- `/usr/lpp/db2*` holds the Db2 product libraries.
+- FTP on port 21 can also submit JCL through the JES reader, but `submit` from
+  USS is simpler.
+
+To stage a file and read a job's output over SSH:
+
+```sh
+ssh <user>@<zos-host> 'cat > /tmp/my.jcl' < ./my.jcl
+ssh <user>@<zos-host> 'cd /tmp && submit my.jcl'
+```
+
+For non-interactive sessions, use an SSH key or an automation tool that reads
+the password from an environment variable — never put a password on a command
+line. Windows users can do the same from WSL2, or use PuTTY/plink.
+
+### 2. Verify Db2 is reachable
+
+Once the bridge is running (step 5):
+
+```sh
+curl -s http://127.0.0.1:8099/health
+# {"ok":true,"connected":true,"version":"DSN09015","icsf":true,...}
+```
+
+`DSN09015` is the version string reported by Db2 V9 for z/OS. **V9 and later**
+subsystems report their own strings; whatever yours returns here simply confirms
+that your JDBC driver reached the right subsystem. The SQL, JCL and COBOL in this
+repository target Db2 for z/OS V9 or later — adjust library, plan and
+load-module names for your release.
+
+### 3. Create the BANKAPP schema
+
+Run `db2/sql/` in numeric order through SPUFI or DSNTEP2. The repository's
+`db2/jcl/RUN-SQL.jcl` wraps DSNTEP2:
+
+```jcl
+//BANKDB   JOB (ACCT),'BANK DDL',CLASS=A,MSGCLASS=X,MSGLEVEL=(1,1)
+//RUNSQL   EXEC PGM=IKJEFT01,DYNAMNBR=50
+//STEPLIB  DD DSN=<db2-sdsnload>,DISP=SHR
+//SYSTSPRT DD SYSOUT=*
+//SYSTSIN  DD *
+  DSN SYSTEM(<subsystem>)
+  RUN PROGRAM(DSNTEP2) PLAN(<dsntep2-plan>) -
+      LIB('<db2-runlib-load>')
+  END
+/*
+//SYSIN    DD DSN=<hlq>.BANKAPP.SQL(DDL),DISP=SHR
+```
+
+Upload a member first, then submit:
+
+```sh
+cp db2/sql/01-create-objects.sql "//'<hlq>.BANKAPP.SQL(DDL)'"
+```
+
+Recommended order: `01-create-objects.sql`, `02-create-procedure.sql`,
+`03-migrate-users.sql`, `04-verify.sql`,
+`09-transactions-notifications.sql`. The numbered `05`–`08` files are
+diagnostics and alternative procedure definitions — see `db2/README.md`.
+
+Two rules from the DDL comments are worth repeating:
+
+- `CREATE DATABASE` leaves the database **STOPPED**. Run
+  `db2/jcl/START-DATABASE.jcl` (`-START DATABASE(BANKDB)`) before using it,
+  or every access fails with `SQLCODE -540 / SQLSTATE 57001`.
+- Do **not** add an `IN <database>.<tablespace>` clause to the tables. On Db2
+  for z/OS an index needs an index table space in the same database; letting
+  Db2 allocate the pair automatically avoids `-540` on tables with primary keys.
+
+### 4. Build HASHUD (COBOL + ICSF + WLM)
+
+This is the most delicate part; the full narrative is in `db2/README.md` and
+`db2/wlm/README.md`. Short version:
+
+1. Compile `db2/cobol/HASHUD.cbl` with `RENT`, `NODYNAM`, and APF-authorised
+   libraries — see `db2/jcl/BUILD-HASHUD.jcl`.
+2. Link the load module into the WLM STEPLIB library and APF-authorise that
+   library (`db2/jcl/APFLINK.jcl`). APF entries added with `SETPROG APF,ADD`
+   do not survive an IPL.
+3. Define the WLM application environment (`db2/wlm/DB9GWLM1.proc`), make its
+   JCL procedure findable in the JES2 `PROC00` concatenation, and activate the
+   WLM policy. `SQLCODE -471` means this step is not done.
+4. Create the external stored procedure with `db2/sql/02-create-procedure.sql`
+   (or `08-hashud-final-working.sql`), then run
+   `db2/jcl/REFRESH-PROCEDURE.jcl`.
+5. Make sure **ICSF is started** on the console (`S ICSF`, then `D ICSF`).
+   `CALL BANKAPP.HASHUD` must return `RETURN_CODE=0`.
+
+Three correctness details documented in the COBOL and SQL sources:
+
+- **CCSID.** Db2 hands COBOL EBCDIC; ICSF hashes the bytes it receives. The
+  program converts EBCDIC 037 → national → ISO-8859-1 (819) so the digest
+  matches `sha256(utf8(password))`. Without it, every existing password stops
+  matching.
+- **Parameter linkage.** A `VARCHAR(100)` input arrives as a 2-byte length
+  prefix followed by data, so the LINKAGE SECTION declares
+  `PIC S9(4) COMP` length plus `PIC X(100)`.
+- **`PARAMETER CCSID EBCDIC`** on `CREATE PROCEDURE`. Without it, Db2 passes
+  COBOL's EBCDIC output parameters through unconverted and JDBC fails with
+  `-4220` (`CharConversionException`).
+
+Verify the digest through the bridge:
+
+```sh
+curl -s -X POST http://127.0.0.1:8099/hash \
+  -H 'Content-Type: application/json' -d '{"text":"password"}'
+# {"hash":"5E884898DA28047151D0E56F8DC6292773603D0D6AABBDD62A11EF721D1542D8",
+#  "returnCode":0,"reasonCode":0}
+```
+
+It must equal the local digest:
+
+```sh
+node -e "console.log(require('crypto').createHash('sha256').update('password').digest('hex').toUpperCase())"
+```
+
+### 5. Start the JDBC bridge
+
+Why a bridge at all: the only client that reaches Db2 for z/OS without a paid
+Db2 Connect licence is the JDBC driver. The Node `ibm_db` CLI/ODBC driver fails
+with `SQL1598N` (licensing) even with correct credentials. The bridge exposes
+fixed, parameterised operations only — no generic SQL endpoint.
+
+> [!IMPORTANT]
+> The bridge **cannot compile or start without your own JDBC jars** in
+> `db2/db2jdbc/`. They are **not provided by this project**. Complete
+> [Bring your own JDBC drivers](#bring-your-own-jdbc-drivers) first.
+> `db2/jdbc-bridge/README.md` has additional background on the bridge API.
+
+Export the connection settings in the shell that starts the bridge, then run it:
+
+```sh
+export DB2_HOST=<zos-host>
+export DB2_PORT=<drda-port>
+export DB2_LOCATION=<db2-location>
+export DB2_USER=<db2-user>
+export DB2_PASSWORD=<db2-password>          # never put this on a command line
+
+cd db2/jdbc-bridge
+./run-bridge.sh
+```
+
+`run-bridge.sh` finds a JDK 17+, compiles `Db2Bridge.java` if the source is
+newer than the class, and listens on `127.0.0.1:8099`. Override `BRIDGE_PORT`,
+`BRIDGE_HOST` or `JAVA_HOME` as needed. On macOS,
+`db2/jdbc-bridge/install-service.sh` installs it as a launchd service; on Linux
+use an equivalent systemd unit; on Windows run it inside WSL2.
+
+The bridge holds no long-lived connection pool — each request opens and closes
+its own connection — so restarting it is safe at any time.
+
+For diagnosis, a small standalone JDBC helper is invaluable (`sql`, `try` to
+run in a transaction and roll back while printing the full `SQLException` chain,
+and `meta` for column defaults/identity). Compile any such helper against the
+same jars:
+
+```sh
+javac -cp db2/db2jdbc/db2jcc4.jar -d ./build Db2Admin.java
+java -cp "./build:db2/db2jdbc/db2jcc4.jar:db2/db2jdbc/db2jcc_license_cisuz.jar" \
+     Db2Admin sql "SELECT COUNT(*) FROM BANKAPP.TRANSACTIONS"
+```
+
+Useful catalog queries:
+
+```sql
+-- table space status: 'A' = available, 'P' = check-pending
+SELECT DBNAME, NAME, STATUS FROM SYSIBM.SYSTABLESPACE
+ WHERE DBNAME LIKE 'DSN%';
+
+-- tables owned by the application schema
+SELECT NAME, DBNAME, TSNAME FROM SYSIBM.SYSTABLES WHERE CREATOR='BANKAPP';
+
+-- check constraints and indexes
+SELECT CHECKNAME, CHECKCONDITION FROM SYSIBM.SYSCHECKS WHERE TBNAME='TRANSACTIONS';
+SELECT NAME, UNIQUERULE, COLCOUNT FROM SYSIBM.SYSINDEXES
+ WHERE TBCREATOR='BANKAPP' AND TBNAME='TRANSACTIONS';
+
+-- registered procedures
+SELECT NAME, ROUTINETYPE, LANGUAGE, EXTERNAL_NAME, PARM_COUNT
+  FROM SYSIBM.SYSROUTINES WHERE NAME LIKE 'HASH%';
+```
+
+> `db2/jdbc-bridge/README.md` describes the bridge's endpoints in detail, but
+> `Db2Bridge.java` is authoritative — the bridge now also serves transfers,
+> transactions and notifications.
+
+### 6. Switch the app to Db2 mode
+
+In `.env`, uncomment and fill in the DB2 block:
+
+```dotenv
+DB2_HOST=<zos-host>
+DB2_PORT=<drda-port>
+DB2_LOCATION=<db2-location>
+DB2_USER=<db2-user>
+DB2_PASSWORD=<db2-password>
 DB2_BRIDGE_URL=http://127.0.0.1:8099
 ```
 
-The ADCD sample system ships with `IBMUSER` / `SYS1`; set `DB2_PASSWORD` to
-whatever your LPAR actually uses. `.env` is git-ignored — never commit it.
+**Restart Next.js — this is required, not optional.** Next.js loads `.env` once
+at boot, so editing `DB2_HOST` has no effect until the process restarts.
+Confirm:
 
-Unset `DB2_HOST` and the site falls back to the PostgreSQL mirror.
-
-### Why JDBC and not `ibm_db`
-
-The Node `ibm_db` driver (IBM CLI/ODBC) **cannot** connect to z/OS without a
-paid Db2 Connect licence — it fails with `SQL1598N ... licensing problem` even
-when the credentials are correct. Verified both ways against this host.
-
-The JDBC driver has no such restriction: `db2jcc4.jar` + the freely
-redistributable `db2jcc_license_cisuz.jar` (both in `db2jdbc/`) connect
-immediately. Hence the bridge.
-
-### Host address
-
-The reachable host is **192.168.200.150**. The `192.168.100.150` in the older
-notes does not respond (100% packet loss) — that value is stale.
-
-### Verified end to end
-
-```
-POST /api/auth/register  -> creates the user in BANKAPP.USERS (z/OS)
-POST /api/auth/login     -> reads BANKAPP.USERS (z/OS), verifies the digest
-GET  /                   -> dashboard shows the real account from BANKAPP.ACCOUNTS
+```sh
+curl -s http://localhost:3000/api/db2/status
+# {"ok":true,"configured":true,"hashing":{"engine":"icsf",...}}
 ```
 
-The opening account is created in `BANKAPP.ACCOUNTS` at registration, matching
-the PostgreSQL behaviour.
-
-> **Hashing engine.** `GET /api/db2/status` reports which engine hashed the most
-> recent password. It now reads `"engine":"icsf"` — the password is hashed by
-> ICSF on the mainframe and the plaintext never leaves the web tier. The site
-> still falls back to Node's SHA-256 (byte-identical digest) if the ICSF call
-> fails, and says so explicitly rather than hiding it — see section 6.
+To go back to PostgreSQL, comment out `DB2_HOST` and restart.
 
 ---
 
-## 6. Verified on the live system
+## Verification checklist
 
-* `BANKDB` database and `BANKAPP.USERS` / `BANKAPP.ACCOUNTS` created.
-* Both migrated rows intact — hashes match the PostgreSQL originals byte for byte.
-* `HASHUD` compiled (RC 0) and link-edited reentrant/reusable
-  (`AMODE 31`, attributes `RN RU`) into `IBMUSER.HDFC.LOAD(HASHUD)` and
-  `DSN910.DB9G.RUNLIB.LOAD(HASHUD)`.
-* `BANKAPP.HASHUD` registered in the Db2 catalog.
-* **JDBC connectivity from the workstation works** (`db2jcc4.jar` +
-  `db2jcc_license_cisuz.jar`, `CURRENT SERVER = DALLAS9`).
-* **The website runs on z/OS Db2**: register, login and the dashboard were all
-  exercised end to end through the browser-facing API routes.
-* **The stored-procedure mechanism now works.** After the WLM policy was
-  activated, `-471` disappeared and `SYSIBM.SQLTABLES` — IBM's own JDBC support
-  procedure — started returning a result set. That was the original blocker.
-* **`HASHUD` produces the correct digest.** Called directly from a batch driver
-  (`cobol/HASHDRV.cbl`, `jcl/BUILD-HASHDRV.jcl`), it returns
-  `5E884898DA28047151D0E56F8DC6292773603D0D6AABBDD62A11EF721D1542D8` for
-  `password` — exactly `SHA-256("password")`.
+Run this after any fresh setup or repair. The `curl` examples assume a real
+`curl` binary; in Windows PowerShell use `curl.exe` or run them in WSL/Git Bash.
 
-### The EBCDIC/ASCII trap (fixed)
+```sh
+# 1. Bridge (Db2 mode only)
+curl -s http://127.0.0.1:8099/health
+curl -s -X POST http://127.0.0.1:8099/hash \
+  -H 'Content-Type: application/json' -d '{"text":"password"}'
 
-ICSF hashes whatever bytes it is handed, and Db2 hands a COBOL program EBCDIC.
-Hashing that directly produced a digest of the **EBCDIC** bytes:
+# 2. App
+curl -s http://localhost:3000/api/health
+curl -s http://localhost:3000/api/db2/status
 
+# 3. Register (captures a real session cookie)
+curl -s -c cookies.txt -X POST http://localhost:3000/api/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"smoketest","email":"smoke@example.com","fullName":"Smoke Test","password":"TestPass123"}'
+
+# 4. Reads
+curl -s -b cookies.txt http://localhost:3000/api/transactions
+curl -s -b cookies.txt http://localhost:3000/api/notifications
+
+# 5. Fund the test account, then look up a payee and send money
+#    PostgreSQL: UPDATE bank_accounts SET balance = 100 WHERE user_id = <id>;
+#    Db2:        UPDATE BANKAPP.ACCOUNTS SET BALANCE = 100 WHERE USER_ID = <id>;
+curl -s -b cookies.txt -X POST http://localhost:3000/api/recipients/lookup \
+  -H 'Content-Type: application/json' -d '{"identifier":"<payee>"}'
+curl -s -b cookies.txt -X POST http://localhost:3000/api/transactions/send \
+  -H 'Content-Type: application/json' \
+  -d '{"identifier":"<payee>","amount":"1.00","password":"TestPass123"}'
+
+# 6. Dismiss notifications, then re-read
+curl -s -b cookies.txt -X POST http://localhost:3000/api/notifications/dismiss \
+  -H 'Content-Type: application/json' -d '{}'
+curl -s -b cookies.txt http://localhost:3000/api/notifications
 ```
-ICSF('password' as EBCDIC) = 61E9F866F42264B13170F6C91BECA68C559E9C409328E695D4B13356526CD0F1
-SHA-256('password' ASCII)  = 5E884898DA28047151D0E56F8DC6292773603D0D6AABBDD62A11EF721D1542D8
+
+Expected: all `200`, a new `SENT` row, one `money_sent` notification, and
+`unread` dropping to `0` after dismiss. Afterwards delete `cookies.txt`, remove
+the smoke-test rows, and restore any balances you changed.
+
+---
+
+## Day-to-day operation
+
+```sh
+# Terminal 1 — mainframe bridge (Db2 mode only)
+cd db2/jdbc-bridge && ./run-bridge.sh
+
+# Terminal 2 — web app, from the repository root
+npm run dev
 ```
 
-Every other tier — browser, Node crypto, the PostgreSQL mirror, and the hashes
-already stored in `BANKAPP.USERS` — uses the ASCII/UTF-8 bytes. Had this shipped,
-**both migrated users would have been locked out the moment ICSF started
-working.** `cobol/HASHUD.cbl` now converts the text before hashing:
+| Task | Command |
+| --- | --- |
+| Start PostgreSQL | `brew services start postgresql@16` (macOS) · `sudo systemctl start postgresql` (Linux) · Windows service |
+| Switch to Db2 | Set `DB2_HOST` in `.env`, **restart** `npm run dev` |
+| Switch to PostgreSQL | Comment out `DB2_HOST`, **restart** `npm run dev` |
+| Check the bridge | `curl -s http://127.0.0.1:8099/health` |
+| Check the app | `curl -s http://localhost:3000/api/health` |
+| Which hash engine ran | `curl -s http://localhost:3000/api/db2/status` |
+| Typecheck / lint | `npm run typecheck` / `npm run lint` |
+| Production build | `npm run build`, then `npm run start` |
 
-```cobol
-MOVE FUNCTION NATIONAL-OF(WS-EBCDIC-TEXT, 037) TO WS-NATIONAL-TEXT
-MOVE FUNCTION DISPLAY-OF(WS-NATIONAL-TEXT, 819) TO WS-ASCII-TEXT
-```
+Stop with `Ctrl-C` in each terminal.
 
-(EBCDIC 037 → national → ISO-8859-1, which is byte-identical to UTF-8 for any
-realistic password.)
+---
 
-### RESOLVED: `-4220` / `-330` — the missing `PARAMETER CCSID EBCDIC`
+## Troubleshooting
 
-`CALL BANKAPP.HASHUD(...)` failed with `SQLCODE -4220` (`CharConversionException`)
-over JDBC, and `SQLCODE -330` when called through an SQL wrapper. The fix was one
-line in `CREATE PROCEDURE`:
+### Application gotchas
+
+**Db2 `CHAR` columns compared against user input.** `ACCOUNT_NUMBER = ?` fails
+with `SQLCODE -302 / 22001` when the parameter is longer than the column — Db2
+tries to *assign* rather than simply not match. Compare as strings:
+`RTRIM(A.ACCOUNT_NUMBER) = CAST(? AS VARCHAR(255))`.
+
+**`SETPROG APF,ADD` does not survive an IPL.** The APF entry for the procedure
+library is lost on every restart, and `-444` comes back. See `db2/README.md`.
+
+**Rate-limit state is an in-process `Map`.** Correct for one server; wrong the
+moment the app is scaled horizontally. Move it to Redis before replicating.
+
+**`src/db/index.ts` throws at import time** if `DATABASE_URL` is missing, even
+in Db2 mode where Drizzle is rarely used. Keep it set, and keep PostgreSQL up.
+
+**`no PostgreSQL user name specified in startup packet`.** If `DATABASE_URL`
+has no username (`postgresql://localhost:5432/app_db`), the `pg` driver falls
+back to `$PGUSER`, then `$USER`. In a non-login shell (CI, an agent, a service)
+both can be empty. Put the role in the URL or export `PGUSER` in the service
+environment.
+
+**Editing `.env` appears to do nothing.** Next.js reads `.env` at boot. Restart
+the dev server after any change, especially to `DB2_HOST`. The bridge is a
+different process and does not read `.env` at all.
+
+### Db2 / ICSF
+
+**`SQLCODE=-904, SQLSTATE=57011, reason 00C900A3` — unavailable resource.**
+A table space is in **CHECK PENDING** (status `P` in
+`SYSIBM.SYSTABLESPACE`), usually after a LOAD or an insert that violated a
+constraint. `GET /api/transactions` then returns 500 and the dashboard stays on
+"Transaction history: Loading…" forever — that is a symptom, not a front-end
+bug: `TransactionHistory` keeps its last good state when a fetch fails.
+
+Confirm, then start the table space with `ACCESS(FORCE)` through the `DSN` TSO
+command processor (on some Db2 V9 subsystems there is no
+`ADMIN_COMMAND_DSN` procedure; calling it returns `SQLCODE=-440`):
 
 ```sql
-    PARAMETER CCSID EBCDIC
+SELECT DBNAME, NAME, STATUS FROM SYSIBM.SYSTABLESPACE WHERE NAME='<tsname>';
+-- ... | <tsname> | P
 ```
 
-**Why.** A COBOL program writes EBCDIC into its output parameters. Without
-`PARAMETER CCSID`, Db2 does not know that, so it passes the EBCDIC bytes straight
-through instead of converting them. The client then tries to decode `0xC1 0xC2 …`
-as UTF-8, which is invalid, and throws. Measured on this system with the **same
-load module**:
-
-| `PARAMETER CCSID` | Result |
-| ----------------- | ------ |
-| *(omitted)* | `SQLCODE -4220` |
-| `EBCDIC` | **correct digest** |
-| `ASCII` | wrong characters |
-| `UNICODE` | `SQLCODE -4220` |
-
-Final definition: `sql/08-hashud-final-working.sql`.
-
-### How it was isolated
-
-The decisive experiment was a diagnostic twin, `cobol/HASHCONST.cbl` — identical
-Db2 linkage, but returning a fixed constant and never calling ICSF:
-
-| Procedure | Kind | Result |
-| --------- | ---- | ------ |
-| `TRIVIAL_CALL` | SQL proc, IN param, result set | works |
-| `TESTOUT` | SQL proc, VARCHAR IN + CHAR(64)/INT OUT | works |
-| `HASHCONST` | **external COBOL**, returns a constant | `-4220` |
-| `HASHUD` | external COBOL, real ICSF | `-4220` |
-
-That exonerated ICSF (HASHCONST never touches it), exonerated OUT parameters
-(TESTOUT round-trips them fine), and left the external-procedure boundary — where
-the CCSID turned out to be the answer.
-
-Things that were tried and **did not** fix it, so they can be skipped next time:
-`file.encoding` on the JVM, `ccsid=` and `retrieveMessagesFromServerOnGetMessage`
-URL properties, `executeUpdate()` vs `execute()`, `Types.CHAR` vs `Types.VARCHAR`,
-dropping `COMMIT ON RETURN YES`, switching the input to `CHAR(100)`, a newer
-driver (JCC 11.5.9.0 cannot authenticate to this Db2 9.1 server at all), and
-`PARAMETER CCSID UNICODE`/`ASCII`.
-
-### Two other real problems found and fixed along the way
-
-These were genuine blockers, separate from the CCSID issue:
-
-1. **`-471` — WLM application environments inactive.** Fixed by activating the
-   WLM policy. Confirmed when `SYSIBM.SQLTABLES`, IBM's own procedure, went from
-   `-471` to returning a result set.
-2. **`-444` — `DSN910.DB9G.RUNLIB.LOAD` was not APF-authorized.** The WLM address
-   space runs APF, so a module from a non-APF library cannot be used. Fixed with
-   `SETPROG APF,ADD,DSNAME=DSN910.DB9G.RUNLIB.LOAD,VOLUME=SBDB91`. Found by
-   reading the APF list in `ADCD.Z111S.PARMLIB(PROGDB)`.
-
-### Verified end to end
-
-```
-'password'  -> 5E884898DA28047151D0E56F8DC6292773603D0D6AABBDD62A11EF721D1542D8
-'test'      -> 9F86D081884C7D659A2FEAA0C55AD015A3BF4F1B2B0B822CD15D6C15B0F00A08
-'Test User' -> 9E95A89B42F1FB5A3EA9F8657EC45354A080B57B8EF2F6DF85B73ADD1F756465
+```jcl
+//DB2FIX  JOB (ACCT),'DB2FIX',CLASS=A,MSGCLASS=X,MSGLEVEL=(1,1)
+//CMDFIX  EXEC PGM=IKJEFT01,DYNAMNBR=50
+//STEPLIB  DD DSN=<db2-sdsnload>,DISP=SHR
+//SYSTSPRT DD PATH='/tmp/fix.out',PATHOPTS=(OWRONLY,OCREAT,OTRUNC)
+//SYSPRINT DD SYSOUT=*
+//SYSTSIN  DD *
+  DSN SYSTEM(<subsystem>)
+  -DISPLAY DATABASE(<dbname>) SPACENAM(<tsname>) RESTRICT
+  -START DATABASE(<dbname>) SPACENAM(<tsname>) ACCESS(FORCE)
+  -DISPLAY DATABASE(<dbname>) SPACENAM(<tsname>) RESTRICT
+  END
+/*
 ```
 
-All return code 0 / reason code 0, and all match
-`hashlib.sha256(pw.encode()).hexdigest()` exactly. The website was then exercised
-end to end: registering a user stored the **ICSF-computed** digest in
-`BANKAPP.USERS`, `GET /api/db2/status` reported `"engine":"icsf"`, logging in
-succeeded, and a wrong password was rejected.
+Writing `SYSTSPRT` to a USS `PATH=` lets you read the job output over SSH
+without SDSF. Afterwards the status should be `A` and reads should work again.
 
-**Passwords are now hashed by ICSF on the mainframe.** The plaintext no longer
-leaves the web tier — the property that was missing throughout.
+**`ERRORCODE=-4228` "Batch failure" on a transfer.** `-4228` is generic; JDBC
+wraps the real error in `getNextException()`. Re-run the failing INSERT inside a
+rolled-back transaction to expose the underlying `SQLCODE`. A common cause is
+schema drift (below), e.g. `SQLCODE=-545, SQLSTATE=23513` from a
+`CHECK (IDEMPOTENCY_KEY IS NOT NULL)` constraint.
+
+**`ICSF hashing failed (return code 12, reason code 0)`.** `/api/db2/status`
+reports `"engine":"local"`. RC 12 means the ICSF started task is down — most
+commonly after an IPL. On the 3270 console: `D ICSF`, then `S ICSF`, then
+re-test `/hash`. Login still works because Node's SHA-256 is byte-identical, but
+treat `"local"` as an incident, not a normal state. `/api/db2/status` caches the
+*last hash result* in process memory, so make one real request (a login or a
+registration) before re-reading it.
+
+> On some locked-down images, `IKJEFT01` with the TSO `CONSOLE` command returns
+> `IKJ55305I ... DOES NOT HAVE CONSOLE COMMAND AUTHORITY`. In that case operator
+> commands must be issued from the 3270 console, not from a batch job.
+
+**`SQL1598N` licensing problem.** You are using the Node `ibm_db` driver
+directly against z/OS. Use the JDBC bridge instead, with **your own**
+`db2jcc_license_cisuz.jar` — the freely redistributable z/OS licence file you
+must obtain from IBM yourself. It is not shipped with this project.
+
+**`ClassNotFoundException: com.ibm.db2.jcc.DB2Driver`, or `javac` cannot find
+the driver classes.** The JDBC jars are missing from `db2/db2jdbc/`. This
+repository does not supply them — see
+[Bring your own JDBC drivers](#bring-your-own-jdbc-drivers).
+
+**`-540`, `-471`, `-444`, `-4220`, `-330`.** See the build checklist in
+[step 4](#4-build-hashud-cobol--icsf--wlm) and `db2/README.md` — these map to a
+stopped database, an inactive WLM environment, a non-APF load library, a
+missing `PARAMETER CCSID EBCDIC`, and the same CCSID issue via an SQL wrapper.
+
+### Schema drift on an existing database
+
+The committed migrations (`drizzle/*.sql`, `db2/sql/09-*.sql`,
+`src/db/schema.ts`) do **not** contain `trx_id` or `idempotency_key` columns.
+**Fresh installs need neither trigger below.**
+
+If an existing database has had an additional transaction-id migration applied
+(those columns `NOT NULL` with unique indexes and no defaults), inserts from the
+app will fail because it does not supply them. This is schema drift, not an
+application bug. Two DB-only compatibility triggers preserve the constraints
+and both unique indexes; code that *does* supply the columns still works, thanks
+to `COALESCE`.
+
+**Db2 for z/OS** — `ID` is `GENERATED BY DEFAULT AS IDENTITY` and is available in
+a `BEFORE` trigger; `REFERENCE` is the natural idempotency key:
+
+```sql
+CREATE TRIGGER BANKAPP.TRX_DEFKEYS
+  NO CASCADE BEFORE INSERT ON BANKAPP.TRANSACTIONS
+  REFERENCING NEW AS N
+  FOR EACH ROW MODE DB2SQL
+  WHEN (N.IDEMPOTENCY_KEY IS NULL OR N.TRX_ID IS NULL)
+  BEGIN ATOMIC
+    SET N.IDEMPOTENCY_KEY = COALESCE(N.IDEMPOTENCY_KEY, N.REFERENCE);
+    SET N.TRX_ID = COALESCE(N.TRX_ID,
+                    'LE' || DIGITS(DECIMAL(N.ID, 10, 0)));
+  END
+```
+
+**PostgreSQL** — `BEFORE` triggers run before `NOT NULL` is enforced:
+
+```sql
+CREATE OR REPLACE FUNCTION bankapp_tx_default_keys() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.idempotency_key IS NULL THEN
+    NEW.idempotency_key := COALESCE(NULLIF(NEW.reference, ''),
+                                    gen_random_uuid()::text);
+  END IF;
+  IF NEW.trx_id IS NULL THEN
+    NEW.trx_id := 'LE' || lpad(NEW.id::text, 10, '0');
+  END IF;
+  RETURN NEW;
+END $$;
+
+DROP TRIGGER IF EXISTS trx_default_keys ON transactions;
+CREATE TRIGGER trx_default_keys BEFORE INSERT ON transactions
+  FOR EACH ROW EXECUTE FUNCTION bankapp_tx_default_keys();
+```
+
+### Browser console noise
+
+```
+A tree hydrated but some attributes of the server rendered HTML didn't match
+... bis_skin_checked="1" ... __processed_...="true"
+unhandledRejection: TypeError: Cannot read properties of undefined (reading 'M_ID')
+    at chrome-extension://...
+```
+
+Not an application bug. A browser extension is injecting attributes into the DOM
+before React hydrates, and the extension's own script is throwing. Disable the
+extension for `localhost`, or use a private/incognito window with extensions
+off. Doing nothing is also safe — React leaves the attributes alone and the app
+works.
+
+---
+
+## Security notes
+
+- `.env` is git-ignored. Never commit `DB2_PASSWORD` or `SESSION_SECRET`.
+- `SESSION_SECRET` must be a real random value outside local development.
+- The JDBC bridge exposes fixed parameterised operations only. There is
+  deliberately no generic SQL endpoint; **do not add one**.
+- The transfer's debit is a conditional `UPDATE ... WHERE BALANCE >= amount`
+  inside a single transaction, so an overdraw loses the race instead of
+  producing a negative balance. The application-level check is only a friendly
+  pre-filter.
+- Money is compared as integer cents / `DECIMAL(14,2)`, never floats.
+- If the ICSF call fails, the app falls back to Node SHA-256 so logins keep
+  working — but the plaintext was then hashed in the web tier. This is reported
+  through `/api/db2/status` rather than hidden.
+- The bridge listens on loopback by default. Do not expose it to untrusted
+  networks.
+- This is a demonstration project: sessions are signed cookies with an 8-hour
+  lifetime, rate limiting is in-process, and there is no CSRF-token layer,
+  audit trail, or KYC. Do not use it to hold real money.
+
+---
+
+## Repository layout
+
+| Path | What |
+| --- | --- |
+| `src/app/` | Next.js pages and API routes |
+| `src/components/` | Dashboard, auth forms, send/receive dialogs, feed provider |
+| `src/lib/auth-service.ts` | Database and hashing switches |
+| `src/lib/transfer-service.ts` | Money movement, both databases |
+| `src/lib/db2.ts` | Mainframe access over the bridge |
+| `src/lib/session.ts`, `hash.ts`, `rate-limit.ts` | Sessions, digests, token buckets |
+| `src/lib/feed-service.ts`, `feed-events.ts` | Dashboard snapshot and change bus |
+| `src/db/schema.ts` | Drizzle schema for the PostgreSQL mirror |
+| `drizzle/*.sql` | PostgreSQL migrations |
+| `db2/sql/` | Db2 DDL in numbered order (`01` … `09`) |
+| `db2/cobol/` | `HASHUD.cbl` (ICSF SHA-256) and diagnostic helpers |
+| `db2/jcl/` | JCL to build/link/refresh the procedure and run SQL |
+| `db2/wlm/` | WLM address-space proc for the external stored procedure |
+| `db2/java/` | Standalone JDBC / hashing diagnostics |
+| `db2/jdbc-bridge/` | Java 17 HTTP bridge (`Db2Bridge.java`) and launch scripts |
+| `db2/db2jdbc/` | **You supply these — not committed, not provided** — `db2jcc4.jar` + `db2jcc_license_cisuz.jar` |
+| `.env.example` | Template for all environment variables |
+| `scripts/publish.sh` | Helper that created and pushed the repository |
+
+## Not committed
+
+`.env`, `node_modules/`, `.next/`, `*.class`, and the **IBM JDBC jars**.
+
+> [!IMPORTANT]
+> `db2jcc4.jar` and `db2jcc_license_cisuz.jar` are **not provided by this
+> project**. They are IBM-licensed binaries that this repository is not allowed
+> to redistribute, and `.gitignore` deliberately excludes them. Every user must
+> obtain their own copy from IBM under their own entitlement and place it in
+> `db2/db2jdbc/`. Requests to have the jars added, attached or sent will be
+> declined — see [Bring your own JDBC drivers](#bring-your-own-jdbc-drivers).
+
+Local assistant/tooling state (`.workbuddy-ai/`) is also ignored.
