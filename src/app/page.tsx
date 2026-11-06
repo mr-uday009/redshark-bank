@@ -2,9 +2,11 @@ import { redirect } from "next/navigation";
 import { getSession } from "@/lib/session";
 import { getAccountsForUser } from "@/lib/auth-service";
 import { isDb2Configured } from "@/lib/db2";
+import { getFeed } from "@/lib/feed-service";
 import LogoutButton from "@/components/LogoutButton";
 import NotificationBell from "@/components/NotificationBell";
 import TransactionHistory from "@/components/TransactionHistory";
+import DashboardFeedProvider from "@/components/DashboardFeedProvider";
 import AccountActions from "@/components/AccountActions";
 import { LogoMark } from "@/components/Logo";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -30,11 +32,16 @@ export default async function HomePage() {
   const totalBalance = accounts.reduce((sum, a) => sum + Number(a.balance), 0);
   const db2Mode = isDb2Configured();
 
+  // The first snapshot is rendered here, so opening the dashboard costs the
+  // client no API call at all — the live updates take over from this state.
+  const feed = await getFeed(session.userId);
+
   const primary = accounts[0];
   const totalBalanceString = totalBalance.toFixed(2);
 
   return (
-    <main className="min-h-screen bg-background">
+    <DashboardFeedProvider initial={feed}>
+      <main className="min-h-screen bg-background">
       <header className="border-b border-border">
         <div className="mx-auto flex max-w-5xl items-center justify-between px-6 py-4">
           <div className="flex items-center gap-2.5">
@@ -53,11 +60,11 @@ export default async function HomePage() {
           <h1 className="text-2xl font-medium tracking-tight">
             Welcome back, {session.fullName || session.username}
           </h1>
-          <p className="mt-1.5 text-sm text-muted-foreground">
+          {/* <p className="mt-1.5 text-sm text-muted-foreground">
             {db2Mode
               ? "Your credentials were verified with a one-way SHA-256 hash computed on IBM Db2 for z/OS via ICSF."
               : "Your credentials were verified with a one-way SHA-256 hash comparison."}
-          </p>
+          </p> */}
         </div>
 
         {/* Left column: balances and accounts. Right column: history, which
@@ -144,6 +151,7 @@ export default async function HomePage() {
           </div>
         </div>
       </section>
-    </main>
+      </main>
+    </DashboardFeedProvider>
   );
 }

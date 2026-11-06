@@ -1,48 +1,21 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
-
-interface Notification {
-  id: number;
-  kind: string;
-  message: string;
-  read: boolean;
-  createdAt: string;
-}
+import { useEffect, useRef, useState } from "react";
+import { useDashboardFeed } from "@/components/DashboardFeedProvider";
 
 /**
  * Bell with an unread badge and a dropdown panel.
  *
- * Polls every 5 seconds while the tab is visible. That is a deliberate
- * trade-off: the alternative is SSE or WebSockets, which would need a
- * long-lived connection the current deployment has nowhere to keep. Polling
- * stops when the tab is hidden so a background tab costs nothing.
+ * It no longer polls. Unread state arrives with the shared dashboard snapshot
+ * and is updated by a server push (api/feed/stream) only when a notification
+ * actually changes, so an idle tab costs nothing.
  */
 export default function NotificationBell() {
-  const [items, setItems] = useState<Notification[]>([]);
-  const [unread, setUnread] = useState(0);
+  const { data, dismiss } = useDashboardFeed();
+  const items = data.notifications;
+  const unread = data.unread;
   const [open, setOpen] = useState(false);
   const wrapRef = useRef<HTMLDivElement>(null);
-
-  const load = useCallback(async () => {
-    try {
-      const res = await fetch("/api/notifications", { cache: "no-store" });
-      if (!res.ok) return;
-      const data = await res.json();
-      setItems(data.notifications ?? []);
-      setUnread(data.unread ?? 0);
-    } catch {
-      // A failed poll is not worth surfacing — the next tick will retry.
-    }
-  }, []);
-
-  useEffect(() => {
-    load();
-    const id = setInterval(() => {
-      if (!document.hidden) load();
-    }, 5000);
-    return () => clearInterval(id);
-  }, [load]);
 
   useEffect(() => {
     function onClick(e: MouseEvent) {
@@ -53,27 +26,6 @@ export default function NotificationBell() {
     document.addEventListener("mousedown", onClick);
     return () => document.removeEventListener("mousedown", onClick);
   }, [open]);
-
-  async function dismiss(id?: number) {
-    // Optimistic: the badge should drop the instant the user clicks.
-    setItems((prev) =>
-      id === undefined
-        ? prev.map((n) => ({ ...n, read: true }))
-        : prev.map((n) => (n.id === id ? { ...n, read: true } : n)),
-    );
-    setUnread((prev) =>
-      id === undefined ? 0 : Math.max(0, prev - (items.find((n) => n.id === id && !n.read) ? 1 : 0)),
-    );
-    try {
-      await fetch("/api/notifications/dismiss", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(id === undefined ? {} : { id }),
-      });
-    } catch {
-      load();
-    }
-  }
 
   return (
     <div className="relative" ref={wrapRef}>
