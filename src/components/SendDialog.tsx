@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Dialog, DialogHeader } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
@@ -39,7 +39,21 @@ export default function SendDialog({
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [receipt, setReceipt] = useState<{ amount: string; to: string } | null>(null);
+  const [receipt, setReceipt] = useState<{
+    amount: string;
+    to: string;
+    trxId?: string;
+  } | null>(null);
+
+  // One key per payment attempt. It stays stable across retries (wrong
+  // password, dropped response, double submit) so the server can recognise a
+  // replay and never charge the account twice. A fresh key is minted when the
+  // dialog is reset for the next payment.
+  const idempotencyKeyRef = useRef("");
+  function paymentKey(): string {
+    if (!idempotencyKeyRef.current) idempotencyKeyRef.current = crypto.randomUUID();
+    return idempotencyKeyRef.current;
+  }
 
   function reset() {
     setStep("recipient");
@@ -50,6 +64,7 @@ export default function SendDialog({
     setError(null);
     setBusy(false);
     setReceipt(null);
+    idempotencyKeyRef.current = crypto.randomUUID();
   }
 
   function close() {
@@ -102,7 +117,10 @@ export default function SendDialog({
     try {
       const res = await fetch("/api/transactions/send", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": paymentKey(),
+        },
         body: JSON.stringify({ identifier, amount, password }),
       });
       const data = await res.json();
@@ -111,7 +129,11 @@ export default function SendDialog({
         setStep("password");
         return;
       }
-      setReceipt({ amount: data.amount, to: recipient.username });
+      setReceipt({
+        amount: data.amount,
+        to: recipient.username,
+        trxId: data.trxId,
+      });
       setStep("done");
       // Refresh the server-rendered balance and history behind the dialog.
       onSent();
@@ -316,9 +338,17 @@ export default function SendDialog({
       {step === "done" && receipt && (
         <div>
           <SuccessCheck
-            title="Payment sent"
+            title={receipt.trxId ? "Payment sent" : "Payment confirmed"}
             subtitle={`$${receipt.amount} to @${receipt.to}`}
           />
+          {receipt.trxId && (
+            <div className="mt-5 rounded-lg border border-border bg-muted/40 px-4 py-3">
+              <p className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                Transaction ID
+              </p>
+              <p className="mt-1 font-mono text-sm tabular-nums">{receipt.trxId}</p>
+            </div>
+          )}
           <Button className="mt-6 w-full" onClick={close}>
             Done
           </Button>

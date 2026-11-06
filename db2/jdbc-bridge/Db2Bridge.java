@@ -350,6 +350,7 @@ public class Db2Bridge {
         int recipAcctId  = toInt(body.get("recipientAccountId"), -1);
         String amountRaw = str(body.get("amount"));
         String reference = str(body.get("reference"));
+        String idempotencyKey = str(body.get("idempotencyKey"));
         String senderName   = str(body.get("senderUsername"));
         String recipName    = str(body.get("recipientUsername"));
 
@@ -371,11 +372,29 @@ public class Db2Bridge {
         if (recipAcctId == senderAcctId) { json(x, 400, err("You cannot send money to your own account.")); return; }
 
         if (reference == null) reference = java.util.UUID.randomUUID().toString();
+        // IDEMPOTENCY_KEY identifies the original payment request. Accept only
+        // simple opaque tokens (UUIDs and similar); anything else gets a fresh
+        // UUID so a malformed key can never be used to replay a payment.
+        if (idempotencyKey == null || !idempotencyKey.matches("[A-Za-z0-9._:-]{1,36}")) {
+            idempotencyKey = java.util.UUID.randomUUID().toString();
+        }
 
         Connection c = null;
         try {
             c = DriverManager.getConnection(URL, DB2_USER, DB2_PWD);
             c.setAutoCommit(false);
+
+            // 0. Idempotency guard. A retried request must replay the original
+            //    receipt rather than debiting the sender a second time. The
+            //    UQ_TX_IDEMPOTENCY constraint is the database-level backstop
+            //    for concurrent duplicates that both pass this check.
+            Map<String, Object> prior = findExistingTransfer(c, idempotencyKey, senderUserId);
+            if (prior != null) {
+                c.rollback();
+                json(x, 200, replayReceipt(c, prior, senderAcctId, recipAcctId,
+                        senderName, idempotencyKey));
+                return;
+            }
 
             // 1. Debit, but only if the funds are actually there.
             try (PreparedStatement ps = c.prepareStatement(
@@ -406,25 +425,35 @@ public class Db2Bridge {
                 }
             }
 
-            // 3. Both sides of the ledger.
+            // 3. Both sides of the ledger. Each side gets its own unique
+            //    12-digit TRX_ID from the mainframe sequence; both carry the
+            //    same IDEMPOTENCY_KEY because they belong to one request.
+            String senderTrxId = nextTrxId(c);
+            String recipTrxId  = nextTrxId(c);
+
             try (PreparedStatement ps = c.prepareStatement(
                     "INSERT INTO BANKAPP.TRANSACTIONS "
-                  + "(USER_ID, ACCOUNT_ID, DIRECTION, AMOUNT, COUNTERPARTY, REFERENCE) "
-                  + "VALUES (?, ?, ?, ?, ?, ?)")) {
-                ps.setInt(1, senderUserId);
-                ps.setInt(2, senderAcctId);
-                ps.setString(3, "SENT");
-                ps.setBigDecimal(4, amount);
-                ps.setString(5, recipName == null ? "unknown" : recipName);
-                ps.setString(6, reference);
+                  + "(TRX_ID, USER_ID, ACCOUNT_ID, DIRECTION, AMOUNT, COUNTERPARTY, "
+                  + " REFERENCE, IDEMPOTENCY_KEY) "
+                  + "VALUES (?, ?, ?, ?, ?, ?, ?, ?)")) {
+                ps.setString(1, senderTrxId);
+                ps.setInt(2, senderUserId);
+                ps.setInt(3, senderAcctId);
+                ps.setString(4, "SENT");
+                ps.setBigDecimal(5, amount);
+                ps.setString(6, recipName == null ? "unknown" : recipName);
+                ps.setString(7, reference);
+                ps.setString(8, idempotencyKey);
                 ps.addBatch();
 
-                ps.setInt(1, recipUserId);
-                ps.setInt(2, recipAcctId);
-                ps.setString(3, "RECEIVED");
-                ps.setBigDecimal(4, amount);
-                ps.setString(5, senderName == null ? "unknown" : senderName);
-                ps.setString(6, reference);
+                ps.setString(1, recipTrxId);
+                ps.setInt(2, recipUserId);
+                ps.setInt(3, recipAcctId);
+                ps.setString(4, "RECEIVED");
+                ps.setBigDecimal(5, amount);
+                ps.setString(6, senderName == null ? "unknown" : senderName);
+                ps.setString(7, reference);
+                ps.setString(8, idempotencyKey);
                 ps.addBatch();
                 ps.executeBatch();
             }
@@ -456,19 +485,84 @@ public class Db2Bridge {
 
             Map<String, Object> out = new LinkedHashMap<String, Object>();
             out.put("reference", reference);
+            out.put("trxId", senderTrxId);
+            out.put("idempotencyKey", idempotencyKey);
             out.put("amount", pretty);
             out.put("messageToSender", toSender);
             out.put("messageToRecipient", toRecipient);
             out.put("senderBalance", balanceOf(c, senderAcctId));
             out.put("recipientBalance", balanceOf(c, recipAcctId));
+            out.put("duplicate", Boolean.FALSE);
             json(x, 200, out);
 
         } catch (SQLException e) {
             if (c != null) { try { c.rollback(); } catch (SQLException ignore) { } }
-            json(x, 502, err("transfer failed: " + e.getMessage()));
+            // -803 = duplicate key. The UNIQUE (IDEMPOTENCY_KEY, USER_ID)
+            // constraint caught a concurrent replay of the same request.
+            if (e.getErrorCode() == -803) {
+                json(x, 409, err("This payment request has already been submitted."));
+            } else {
+                json(x, 502, err("transfer failed: " + e.getMessage()));
+            }
         } finally {
             if (c != null) { try { c.close(); } catch (SQLException ignore) { } }
         }
+    }
+
+    /** Allocate one unique 12-digit TRX_ID from BANKAPP.TRX_ID_SEQ. */
+    static String nextTrxId(Connection c) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT NEXT VALUE FOR BANKAPP.TRX_ID_SEQ FROM SYSIBM.SYSDUMMY1")) {
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) throw new SQLException("TRX_ID sequence returned no value");
+                String value = rs.getBigDecimal(1).toPlainString();
+                if (value.length() != 12 || !value.matches("[0-9]{12}")) {
+                    throw new SQLException("TRX_ID is not 12 digits: " + value);
+                }
+                return value;
+            }
+        }
+    }
+
+    /** Look up the SENT ledger row for an already-processed payment request. */
+    static Map<String, Object> findExistingTransfer(
+            Connection c, String idempotencyKey, int senderUserId) throws SQLException {
+        try (PreparedStatement ps = c.prepareStatement(
+                "SELECT TRX_ID, REFERENCE, AMOUNT, COUNTERPARTY FROM BANKAPP.TRANSACTIONS "
+              + "WHERE IDEMPOTENCY_KEY = ? AND USER_ID = ? AND DIRECTION = 'SENT' "
+              + "FETCH FIRST 1 ROW ONLY")) {
+            ps.setString(1, idempotencyKey);
+            ps.setInt(2, senderUserId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) return null;
+                Map<String, Object> r = new LinkedHashMap<String, Object>();
+                r.put("trxId", rs.getString("TRX_ID").trim());
+                r.put("reference", rs.getString("REFERENCE").trim());
+                r.put("amount", rs.getBigDecimal("AMOUNT").toPlainString());
+                r.put("counterparty", rs.getString("COUNTERPARTY").trim());
+                return r;
+            }
+        }
+    }
+
+    /** Replay the original receipt instead of charging the account twice. */
+    static Map<String, Object> replayReceipt(Connection c, Map<String, Object> prior,
+            int senderAcctId, int recipAcctId, String senderName,
+            String idempotencyKey) throws SQLException {
+        String amount = (String) prior.get("amount");
+        String to = (String) prior.get("counterparty");
+        Map<String, Object> out = new LinkedHashMap<String, Object>();
+        out.put("reference", prior.get("reference"));
+        out.put("trxId", prior.get("trxId"));
+        out.put("idempotencyKey", idempotencyKey);
+        out.put("amount", amount);
+        out.put("messageToSender", "$" + amount + " sent to " + to);
+        out.put("messageToRecipient", (senderName == null ? "Someone" : senderName)
+                + " sent $" + amount + " to you");
+        out.put("senderBalance", balanceOf(c, senderAcctId));
+        out.put("recipientBalance", balanceOf(c, recipAcctId));
+        out.put("duplicate", Boolean.TRUE);
+        return out;
     }
 
     static String balanceOf(Connection c, int accountId) throws SQLException {
@@ -493,7 +587,8 @@ public class Db2Bridge {
         catch (NumberFormatException ignore) { }
         if (limit < 1 || limit > 200) limit = 50;
 
-        String sql = "SELECT ID, DIRECTION, AMOUNT, COUNTERPARTY, REFERENCE, CREATED_AT "
+        String sql = "SELECT ID, TRX_ID, DIRECTION, AMOUNT, COUNTERPARTY, REFERENCE, "
+                   + "IDEMPOTENCY_KEY, CREATED_AT "
                    + "FROM BANKAPP.TRANSACTIONS WHERE USER_ID = ? "
                    + "ORDER BY CREATED_AT DESC, ID DESC FETCH FIRST " + limit + " ROWS ONLY";
         try (Connection c = DriverManager.getConnection(URL, DB2_USER, DB2_PWD);
@@ -504,11 +599,13 @@ public class Db2Bridge {
                 while (rs.next()) {
                     Map<String, Object> t = new LinkedHashMap<String, Object>();
                     t.put("id", Integer.valueOf(rs.getInt("ID")));
+                    t.put("trxId", trim(rs.getString("TRX_ID")));
                     t.put("direction", rs.getString("DIRECTION"));
                     java.math.BigDecimal a = rs.getBigDecimal("AMOUNT");
                     t.put("amount", a == null ? "0" : a.toPlainString());
                     t.put("counterparty", rs.getString("COUNTERPARTY"));
                     t.put("reference", rs.getString("REFERENCE"));
+                    t.put("idempotencyKey", trim(rs.getString("IDEMPOTENCY_KEY")));
                     Timestamp ts = rs.getTimestamp("CREATED_AT");
                     t.put("createdAt", ts == null ? null : ts.toString());
                     list.add(t);
@@ -619,6 +716,11 @@ public class Db2Bridge {
         if (o == null) return null;
         String s = String.valueOf(o);
         return s.isEmpty() ? null : s;
+    }
+
+    /** CHAR columns are blank-padded on z/OS; trim before sending JSON. */
+    static String trim(String s) {
+        return s == null ? "" : s.trim();
     }
 
     /**
