@@ -32,6 +32,7 @@ against PostgreSQL.
 
 ## Contents
 
+- [Security notes](#security-notes)
 - [Stack](#stack)
 - [How it fits together](#how-it-fits-together)
 - [Requirements](#requirements)
@@ -44,9 +45,30 @@ against PostgreSQL.
 - [Verification checklist](#verification-checklist)
 - [Day-to-day operation](#day-to-day-operation)
 - [Troubleshooting](#troubleshooting)
-- [Security notes](#security-notes)
 - [Repository layout](#repository-layout)
 - [Not committed](#not-committed)
+
+---
+
+## Security notes
+
+- `.env` is git-ignored. Never commit `DB2_PASSWORD` or `SESSION_SECRET`.
+- `SESSION_SECRET` must be a real random value outside local development.
+- The JDBC bridge exposes fixed parameterised operations only. There is
+  deliberately no generic SQL endpoint; **do not add one**.
+- The transfer's debit is a conditional `UPDATE ... WHERE BALANCE >= amount`
+  inside a single transaction, so an overdraw loses the race instead of
+  producing a negative balance. The application-level check is only a friendly
+  pre-filter.
+- Money is compared as integer cents / `DECIMAL(14,2)`, never floats.
+- If the ICSF call fails, the app falls back to Node SHA-256 so logins keep
+  working — but the plaintext was then hashed in the web tier. This is reported
+  through `/api/db2/status` rather than hidden.
+- The bridge listens on loopback by default. Do not expose it to untrusted
+  networks.
+- This is a demonstration project: sessions are signed cookies with an 8-hour
+  lifetime, rate limiting is in-process, and there is no CSRF-token layer,
+  audit trail, or KYC. Do not use it to hold real money.
 
 ---
 
@@ -330,6 +352,38 @@ The authoritative definitions are `src/db/schema.ts` and `drizzle/*.sql` for
 PostgreSQL, and `db2/sql/01-create-objects.sql` plus
 `db2/sql/09-transactions-notifications.sql` for Db2.
 
+### Transaction identifiers
+
+Every ledger row carries two identifiers, and both are shown under each entry in
+the Transaction history panel.
+
+| Column | PostgreSQL | Db2 for z/OS | Rule |
+| --- | --- | --- | --- |
+| `TRX_ID` | `varchar(12)` | `CHAR(12)` | Unique **12-digit decimal**, the business `PRIMARY KEY`. |
+| `IDEMPOTENCY_KEY` | `varchar(36)` | `CHAR(36)` | Identifies the original payment request. |
+
+* **`TRX_ID` is allocated by a sequence**, so it is unique by construction and
+  the primary key rejects any collision. PostgreSQL uses
+  `transactions_trx_id_seq`, Db2 uses `BANKAPP.TRX_ID_SEQ`; both start at
+  `200000000000`. Historical rows were backfilled as `100000000000 + id`, a
+  disjoint range, so the sequence can never reissue one of them.
+* **`IDEMPOTENCY_KEY` is shared by the `SENT` and `RECEIVED` rows** of one
+  transfer, because both belong to the same request. Uniqueness is therefore
+  per account: `UNIQUE (idempotency_key, user_id)` lets the two sides coexist
+  while preventing either account from replaying the same request.
+* Sending the same key twice is safe. The server returns the original receipt
+  with `duplicate: true` and does not move money again; the `UNIQUE` constraint
+  is the backstop for two concurrent copies of the same request.
+
+`POST /api/transactions/send` accepts the key as an `Idempotency-Key` header
+(or an `idempotencyKey` body field). The browser generates one UUID per payment
+attempt and reuses it across retries.
+
+Upgrading an existing Db2 installation? Run `db2/sql/10-trx-id-idempotency.sql`
+once. Db2 9.1 cannot `ALTER COLUMN … SET NOT NULL`, so that script rebuilds the
+table while preserving every row, ID, and timestamp. Fresh installs only need
+the updated `09` script.
+
 ---
 
 ## HTTP API
@@ -344,7 +398,7 @@ PostgreSQL, and `db2/sql/01-create-objects.sql` plus
 | GET | `/api/auth/me` | Current session. |
 | POST | `/api/recipients/lookup` | `{identifier}` → payee, by username, email, or account number. |
 | GET | `/api/transactions` | Last 50 ledger rows. |
-| POST | `/api/transactions/send` | `{identifier,amount,password}` — password-confirmed. |
+| POST | `/api/transactions/send` | `{identifier,amount,password}` — password-confirmed. Send an `Idempotency-Key` header to make retries safe. Returns `trxId` and `idempotencyKey`. |
 | GET | `/api/notifications` | Last 50 plus an `unread` count. |
 | POST | `/api/notifications/dismiss` | `{id}` or `{}` for all. |
 | GET | `/api/feed` | One dashboard snapshot, with ETag / `304` support. |
@@ -668,18 +722,27 @@ curl -s -b cookies.txt http://localhost:3000/api/notifications
 curl -s -b cookies.txt -X POST http://localhost:3000/api/recipients/lookup \
   -H 'Content-Type: application/json' -d '{"identifier":"<payee>"}'
 curl -s -b cookies.txt -X POST http://localhost:3000/api/transactions/send \
-  -H 'Content-Type: application/json' \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: smoke-1' \
   -d '{"identifier":"<payee>","amount":"1.00","password":"TestPass123"}'
+# → {"ok":true,"trxId":"200000000001","idempotencyKey":"smoke-1","duplicate":false,...}
 
-# 6. Dismiss notifications, then re-read
+# 6. Replay the same Idempotency-Key — the receipt comes back, nothing is charged
+curl -s -b cookies.txt -X POST http://localhost:3000/api/transactions/send \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: smoke-1' \
+  -d '{"identifier":"<payee>","amount":"1.00","password":"TestPass123"}'
+# → {"duplicate":true,...} and the sender's balance is unchanged
+
+# 7. Dismiss notifications, then re-read
 curl -s -b cookies.txt -X POST http://localhost:3000/api/notifications/dismiss \
   -H 'Content-Type: application/json' -d '{}'
 curl -s -b cookies.txt http://localhost:3000/api/notifications
 ```
 
 Expected: all `200`, a new `SENT` row, one `money_sent` notification, and
-`unread` dropping to `0` after dismiss. Afterwards delete `cookies.txt`, remove
-the smoke-test rows, and restore any balances you changed.
+`unread` dropping to `0` after dismiss. The send response must carry a 12-digit
+`trxId` that also appears in `GET /api/transactions`, and the replay in step 6
+must return `duplicate: true` without changing the balance. Afterwards delete
+`cookies.txt`, remove the smoke-test rows, and restore any balances you changed.
 
 ---
 
@@ -872,27 +935,7 @@ works.
 
 ---
 
-## Security notes
 
-- `.env` is git-ignored. Never commit `DB2_PASSWORD` or `SESSION_SECRET`.
-- `SESSION_SECRET` must be a real random value outside local development.
-- The JDBC bridge exposes fixed parameterised operations only. There is
-  deliberately no generic SQL endpoint; **do not add one**.
-- The transfer's debit is a conditional `UPDATE ... WHERE BALANCE >= amount`
-  inside a single transaction, so an overdraw loses the race instead of
-  producing a negative balance. The application-level check is only a friendly
-  pre-filter.
-- Money is compared as integer cents / `DECIMAL(14,2)`, never floats.
-- If the ICSF call fails, the app falls back to Node SHA-256 so logins keep
-  working — but the plaintext was then hashed in the web tier. This is reported
-  through `/api/db2/status` rather than hidden.
-- The bridge listens on loopback by default. Do not expose it to untrusted
-  networks.
-- This is a demonstration project: sessions are signed cookies with an 8-hour
-  lifetime, rate limiting is in-process, and there is no CSRF-token layer,
-  audit trail, or KYC. Do not use it to hold real money.
-
----
 
 ## Repository layout
 
@@ -921,12 +964,3 @@ works.
 
 `.env`, `node_modules/`, `.next/`, `*.class`, and the **IBM JDBC jars**.
 
-> [!IMPORTANT]
-> `db2jcc4.jar` and `db2jcc_license_cisuz.jar` are **not provided by this
-> project**. They are IBM-licensed binaries that this repository is not allowed
-> to redistribute, and `.gitignore` deliberately excludes them. Every user must
-> obtain their own copy from IBM under their own entitlement and place it in
-> `db2/db2jdbc/`. Requests to have the jars added, attached or sent will be
-> declined — see [Bring your own JDBC drivers](#bring-your-own-jdbc-drivers).
-
-Local assistant/tooling state (`.workbuddy-ai/`) is also ignored.

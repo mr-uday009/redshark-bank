@@ -9,7 +9,7 @@
 
 import { randomUUID } from "node:crypto";
 import { and, desc, eq, sql } from "drizzle-orm";
-import { db } from "@/db";
+import { db, pool } from "@/db";
 import { authUsers, bankAccounts, notifications, transactions } from "@/db/schema";
 import {
   isDb2Configured,
@@ -25,6 +25,7 @@ import {
 } from "@/lib/db2";
 import { hashPassword } from "@/lib/auth-service";
 import { timingSafeEqualHex } from "@/lib/hash";
+import { assertTrxId, normalizeIdempotencyKey } from "@/lib/transaction-ids";
 
 export class TransferError extends Error {}
 
@@ -39,10 +40,14 @@ export interface Recipient {
 
 export interface TransactionRow {
   id: number;
+  /** Unique 12-digit business primary key. */
+  trxId: string;
   direction: "SENT" | "RECEIVED";
   amount: string;
   counterparty: string;
   reference: string;
+  /** Identifies the original payment request. */
+  idempotencyKey: string;
   createdAt: string;
 }
 
@@ -56,10 +61,15 @@ export interface NotificationRow {
 
 export interface TransferResult {
   reference: string;
+  /** 12-digit TRX_ID of the sender's ledger row. */
+  trxId: string;
+  idempotencyKey: string;
   amount: string;
   messageToSender: string;
   messageToRecipient: string;
   senderBalance: string;
+  /** True when the original receipt was replayed instead of charging again. */
+  duplicate?: boolean;
 }
 
 /** Money is compared as integers of cents — never as floats. */
@@ -71,6 +81,32 @@ function toCents(value: string): number {
 
 export function formatAmount(cents: number): string {
   return (cents / 100).toFixed(2);
+}
+
+/**
+ * Postgres allocates TRX_IDs from the same kind of 12-digit sequence that
+ * BANKAPP.TRX_ID_SEQ provides on Db2. Sequences are non-transactional, so a
+ * rolled-back transfer simply leaves a gap — never a duplicate.
+ */
+async function allocateTrxId(): Promise<string> {
+  const { rows } = await pool.query<{ trx_id: string }>(
+    "SELECT nextval('transactions_trx_id_seq')::text AS trx_id",
+  );
+  return assertTrxId(rows[0]?.trx_id);
+}
+
+/** Drizzle wraps the pg driver error; walk the cause chain to find 23505. */
+function isUniqueViolation(err: unknown): boolean {
+  let current: unknown = err;
+  for (let depth = 0; depth < 5 && current; depth += 1) {
+    if (typeof current === "object" && current !== null) {
+      if ((current as { code?: string }).code === "23505") return true;
+      current = (current as { cause?: unknown }).cause;
+    } else {
+      break;
+    }
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -163,6 +199,8 @@ export interface SendInput {
   recipient: Recipient;
   /** Decimal string, e.g. "100.00". */
   amount: string;
+  /** Optional client key identifying the original payment request. */
+  idempotencyKey?: string;
 }
 
 /**
@@ -182,6 +220,7 @@ export async function sendTransfer(input: SendInput): Promise<TransferResult> {
   }
 
   const amount = formatAmount(cents);
+  const idempotencyKey = normalizeIdempotencyKey(input.idempotencyKey);
 
   // 1. The sender must own an account with the funds.
   const senderAccount = await getPrimaryAccount(input.senderUserId);
@@ -209,13 +248,17 @@ export async function sendTransfer(input: SendInput): Promise<TransferResult> {
       recipientAccountId: input.recipient.accountId,
       recipientUsername: input.recipient.username,
       amount,
+      idempotencyKey,
     });
     return {
       reference: r.reference,
+      trxId: r.trxId,
+      idempotencyKey: r.idempotencyKey,
       amount: r.amount,
       messageToSender: r.messageToSender,
       messageToRecipient: r.messageToRecipient,
       senderBalance: r.senderBalance,
+      duplicate: r.duplicate,
     };
   }
 
@@ -226,6 +269,7 @@ export async function sendTransfer(input: SendInput): Promise<TransferResult> {
     recipient: input.recipient,
     amount,
     cents,
+    idempotencyKey,
   });
 }
 
@@ -272,80 +316,132 @@ async function sendPostgresTransfer(args: {
   recipient: Recipient;
   amount: string;
   cents: number;
+  idempotencyKey: string;
 }): Promise<TransferResult> {
   const reference = randomUUID();
 
-  return db.transaction(async (tx) => {
-    const debited = await tx
-      .update(bankAccounts)
-      .set({ balance: sql`${bankAccounts.balance} - ${args.amount}` })
-      .where(
-        and(
-          eq(bankAccounts.id, args.senderAccountId),
-          sql`${bankAccounts.balance} >= ${args.amount}`,
-        ),
-      )
-      .returning({ balance: bankAccounts.balance });
+  // Idempotency guard: replaying a request returns the original receipt and
+  // never moves money twice. UNIQUE (idempotency_key, user_id) is the
+  // database-level backstop for concurrent duplicates.
+  const prior = await db
+    .select({
+      trxId: transactions.trxId,
+      reference: transactions.reference,
+      amount: transactions.amount,
+      counterparty: transactions.counterparty,
+    })
+    .from(transactions)
+    .where(
+      and(
+        eq(transactions.idempotencyKey, args.idempotencyKey),
+        eq(transactions.userId, args.senderUserId),
+        eq(transactions.direction, "SENT"),
+      ),
+    )
+    .limit(1);
 
-    if (debited.length !== 1) {
-      throw new TransferError(
-        "Insufficient funds. The amount exceeds your available balance.",
-      );
-    }
-
-    const credited = await tx
-      .update(bankAccounts)
-      .set({ balance: sql`${bankAccounts.balance} + ${args.amount}` })
-      .where(eq(bankAccounts.id, args.recipient.accountId))
-      .returning({ balance: bankAccounts.balance });
-
-    if (credited.length !== 1) {
-      throw new TransferError("The recipient's account could not be credited.");
-    }
-
-    await tx.insert(transactions).values([
-      {
-        userId: args.senderUserId,
-        accountId: args.senderAccountId,
-        direction: "SENT",
-        amount: args.amount,
-        counterparty: args.recipient.username,
-        reference,
-      },
-      {
-        userId: args.recipient.userId,
-        accountId: args.recipient.accountId,
-        direction: "RECEIVED",
-        amount: args.amount,
-        counterparty: args.senderUsername,
-        reference,
-      },
-    ]);
-
-    const messageToRecipient = `${args.senderUsername} sent $${args.amount} to you`;
-    const messageToSender = `$${args.amount} sent to ${args.recipient.username}`;
-
-    await tx.insert(notifications).values([
-      {
-        userId: args.recipient.userId,
-        kind: "money_received",
-        message: messageToRecipient,
-      },
-      {
-        userId: args.senderUserId,
-        kind: "money_sent",
-        message: messageToSender,
-      },
-    ]);
-
+  if (prior[0]) {
+    const account = await getPrimaryAccount(args.senderUserId);
     return {
-      reference,
-      amount: args.amount,
-      messageToSender,
-      messageToRecipient,
-      senderBalance: debited[0].balance,
+      reference: prior[0].reference,
+      trxId: prior[0].trxId,
+      idempotencyKey: args.idempotencyKey,
+      amount: prior[0].amount,
+      messageToSender: `$${prior[0].amount} sent to ${prior[0].counterparty}`,
+      messageToRecipient: `${args.senderUsername} sent $${prior[0].amount} to you`,
+      senderBalance: account?.balance ?? "0",
+      duplicate: true,
     };
-  });
+  }
+
+  // Each side of the ledger gets its own unique 12-digit TRX_ID.
+  const senderTrxId = await allocateTrxId();
+  const recipientTrxId = await allocateTrxId();
+
+  try {
+    return await db.transaction(async (tx) => {
+      const debited = await tx
+        .update(bankAccounts)
+        .set({ balance: sql`${bankAccounts.balance} - ${args.amount}` })
+        .where(
+          and(
+            eq(bankAccounts.id, args.senderAccountId),
+            sql`${bankAccounts.balance} >= ${args.amount}`,
+          ),
+        )
+        .returning({ balance: bankAccounts.balance });
+
+      if (debited.length !== 1) {
+        throw new TransferError(
+          "Insufficient funds. The amount exceeds your available balance.",
+        );
+      }
+
+      const credited = await tx
+        .update(bankAccounts)
+        .set({ balance: sql`${bankAccounts.balance} + ${args.amount}` })
+        .where(eq(bankAccounts.id, args.recipient.accountId))
+        .returning({ balance: bankAccounts.balance });
+
+      if (credited.length !== 1) {
+        throw new TransferError("The recipient's account could not be credited.");
+      }
+
+      await tx.insert(transactions).values([
+        {
+          trxId: senderTrxId,
+          userId: args.senderUserId,
+          accountId: args.senderAccountId,
+          direction: "SENT",
+          amount: args.amount,
+          counterparty: args.recipient.username,
+          reference,
+          idempotencyKey: args.idempotencyKey,
+        },
+        {
+          trxId: recipientTrxId,
+          userId: args.recipient.userId,
+          accountId: args.recipient.accountId,
+          direction: "RECEIVED",
+          amount: args.amount,
+          counterparty: args.senderUsername,
+          reference,
+          idempotencyKey: args.idempotencyKey,
+        },
+      ]);
+
+      const messageToRecipient = `${args.senderUsername} sent $${args.amount} to you`;
+      const messageToSender = `$${args.amount} sent to ${args.recipient.username}`;
+
+      await tx.insert(notifications).values([
+        {
+          userId: args.recipient.userId,
+          kind: "money_received",
+          message: messageToRecipient,
+        },
+        {
+          userId: args.senderUserId,
+          kind: "money_sent",
+          message: messageToSender,
+        },
+      ]);
+
+      return {
+        reference,
+        trxId: senderTrxId,
+        idempotencyKey: args.idempotencyKey,
+        amount: args.amount,
+        messageToSender,
+        messageToRecipient,
+        senderBalance: debited[0].balance,
+      };
+    });
+  } catch (err) {
+    if (isUniqueViolation(err)) {
+      throw new TransferError("This payment request has already been submitted.");
+    }
+    throw err;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -357,10 +453,12 @@ export async function getTransactionsForUser(userId: number): Promise<Transactio
     const rows = await getDb2Transactions(userId);
     return rows.map((t) => ({
       id: t.id,
+      trxId: t.trxId,
       direction: t.direction,
       amount: t.amount,
       counterparty: t.counterparty,
       reference: t.reference,
+      idempotencyKey: t.idempotencyKey,
       createdAt: t.createdAt ?? "",
     }));
   }
@@ -374,10 +472,12 @@ export async function getTransactionsForUser(userId: number): Promise<Transactio
 
   return rows.map((t) => ({
     id: t.id,
+    trxId: t.trxId,
     direction: t.direction as "SENT" | "RECEIVED",
     amount: t.amount,
     counterparty: t.counterparty,
     reference: t.reference,
+    idempotencyKey: t.idempotencyKey,
     createdAt: t.createdAt.toISOString(),
   }));
 }

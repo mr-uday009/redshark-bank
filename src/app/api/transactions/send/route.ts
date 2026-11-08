@@ -34,6 +34,13 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Missing required fields." }, { status: 400 });
     }
 
+    // A client may supply the key that identifies the original payment
+    // request. Re-sending it (a retry after a dropped response, a double
+    // submit) must not charge the account twice.
+    const idempotencyKey =
+      request.headers.get("idempotency-key") ??
+      (typeof body?.idempotencyKey === "string" ? body.idempotencyKey : undefined);
+
     const recipient: Recipient | null = await lookupRecipient(identifier, session.userId);
     if (!recipient) {
       return NextResponse.json(
@@ -48,11 +55,15 @@ export async function POST(request: Request) {
       password,
       recipient,
       amount,
+      idempotencyKey,
     });
 
     // Both sides of the transfer get a new ledger row and a notification, so
     // both dashboards need to know. Published only after the commit above.
-    await notifyFeedChange([session.userId, recipient.userId], "transfer");
+    // A replayed idempotency key changed nothing, so it needs no push.
+    if (!result.duplicate) {
+      await notifyFeedChange([session.userId, recipient.userId], "transfer");
+    }
 
     return NextResponse.json({
       ok: true,
