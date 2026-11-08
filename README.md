@@ -32,6 +32,7 @@ against PostgreSQL.
 
 ## Contents
 
+- [Security notes](#security-notes)
 - [Stack](#stack)
 - [How it fits together](#how-it-fits-together)
 - [Requirements](#requirements)
@@ -44,9 +45,30 @@ against PostgreSQL.
 - [Verification checklist](#verification-checklist)
 - [Day-to-day operation](#day-to-day-operation)
 - [Troubleshooting](#troubleshooting)
-- [Security notes](#security-notes)
 - [Repository layout](#repository-layout)
 - [Not committed](#not-committed)
+
+---
+
+## Security notes
+
+- `.env` is git-ignored. Never commit `DB2_PASSWORD` or `SESSION_SECRET`.
+- `SESSION_SECRET` must be a real random value outside local development.
+- The JDBC bridge exposes fixed parameterised operations only. There is
+  deliberately no generic SQL endpoint; **do not add one**.
+- The transfer's debit is a conditional `UPDATE ... WHERE BALANCE >= amount`
+  inside a single transaction, so an overdraw loses the race instead of
+  producing a negative balance. The application-level check is only a friendly
+  pre-filter.
+- Money is compared as integer cents / `DECIMAL(14,2)`, never floats.
+- If the ICSF call fails, the app falls back to Node SHA-256 so logins keep
+  working — but the plaintext was then hashed in the web tier. This is reported
+  through `/api/db2/status` rather than hidden.
+- The bridge listens on loopback by default. Do not expose it to untrusted
+  networks.
+- This is a demonstration project: sessions are signed cookies with an 8-hour
+  lifetime, rate limiting is in-process, and there is no CSRF-token layer,
+  audit trail, or KYC. Do not use it to hold real money.
 
 ---
 
@@ -913,27 +935,7 @@ works.
 
 ---
 
-## Security notes
 
-- `.env` is git-ignored. Never commit `DB2_PASSWORD` or `SESSION_SECRET`.
-- `SESSION_SECRET` must be a real random value outside local development.
-- The JDBC bridge exposes fixed parameterised operations only. There is
-  deliberately no generic SQL endpoint; **do not add one**.
-- The transfer's debit is a conditional `UPDATE ... WHERE BALANCE >= amount`
-  inside a single transaction, so an overdraw loses the race instead of
-  producing a negative balance. The application-level check is only a friendly
-  pre-filter.
-- Money is compared as integer cents / `DECIMAL(14,2)`, never floats.
-- If the ICSF call fails, the app falls back to Node SHA-256 so logins keep
-  working — but the plaintext was then hashed in the web tier. This is reported
-  through `/api/db2/status` rather than hidden.
-- The bridge listens on loopback by default. Do not expose it to untrusted
-  networks.
-- This is a demonstration project: sessions are signed cookies with an 8-hour
-  lifetime, rate limiting is in-process, and there is no CSRF-token layer,
-  audit trail, or KYC. Do not use it to hold real money.
-
----
 
 ## Repository layout
 
@@ -962,12 +964,3 @@ works.
 
 `.env`, `node_modules/`, `.next/`, `*.class`, and the **IBM JDBC jars**.
 
-> [!IMPORTANT]
-> `db2jcc4.jar` and `db2jcc_license_cisuz.jar` are **not provided by this
-> project**. They are IBM-licensed binaries that this repository is not allowed
-> to redistribute, and `.gitignore` deliberately excludes them. Every user must
-> obtain their own copy from IBM under their own entitlement and place it in
-> `db2/db2jdbc/`. Requests to have the jars added, attached or sent will be
-> declined — see [Bring your own JDBC drivers](#bring-your-own-jdbc-drivers).
-
-Local assistant/tooling state (`.workbuddy-ai/`) is also ignored.
